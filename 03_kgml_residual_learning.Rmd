@@ -1,0 +1,1866 @@
+---
+title: "03 KGML Residual Learning"
+author: "Jianqiu Zheng"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+source("R/helpers.R")
+library(rsample)
+library(ranger)
+library(mgcv)
+library(caret)
+library(xgboost)
+```
+
+## Purpose
+
+This notebook tests KGML models that learn the residual between observed respiration and mechanistic predictions.
+The mechanistic baseline uses a fixed `Vh0 = 0.10` so that KGML learns
+discrepancy from a prescribed accessibility assumption rather than from
+sample-specific accessibility values.
+
+## Workflow map
+
+This script is organized into five parts:
+
+1. Build the fixed-`Vh0` mechanistic baseline and residual target.
+2. Fit the main KGML models and pure data-driven benchmark models under site-grouped validation.
+3. Run diagnostic and sensitivity checks, including NPOC transformations, `Vh0` sensitivity, and Bulk+FTICR upper-bound models.
+4. Combine predictions and statistics into reusable CSV tables.
+5. Generate manuscript and supplement figures for Section 3.3.
+
+## 1. Fixed-`Vh0` KGML Analysis Table
+
+This chunk reads the mechanistic predictions from script 02 and rebuilds the mechanistic baseline with a prescribed universal `Vh0`.
+The residual target for KGML is `dR = observed log10(R) - mechanistic log10(R)`.
+Change `fixed_vh0_kgml` here if you want to rerun script 03 with a different fixed accessibility baseline.
+
+```{r load-data}
+mech <- read_csv(derived_file("mechanistic_predictions.csv"),
+                 col_types = cols(site = col_character()))
+
+fixed_vh0_kgml <- 0.10
+
+kgml_base <- mech %>%
+  mutate(
+    Vh0_fixed = fixed_vh0_kgml,
+    thermo_accessibility = abs(stoichMet_donor_mean) / (Vh0_fixed * npoc),
+    R_mech_fixed_vh0 = exp(-thermo_accessibility) * biomass_log10,
+    logR_mech_fixed_vh0 = safe_log10(R_mech_fixed_vh0),
+    dR_fixed_vh0 = logR_obs - logR_mech_fixed_vh0
+  ) %>%
+  transmute(
+    site, Position,
+    respC, npoc, inv_npoc, log_npoc = log10(npoc),
+    biomass = biomass_log10,
+    delGcat = delGcat_mean,
+    lambda = lambda_mean,
+    ne = ne_mean,
+    stoichMet_donor = stoichMet_donor_mean,
+    clay, silt, fine, med, coarse, ssa_tot, d50_mm,
+    Vh0_fixed, thermo_accessibility,
+    logR_obs,
+    logR_mech = logR_mech_fixed_vh0,
+    dR = dR_fixed_vh0
+  ) %>%
+  filter(if_all(c(respC, npoc, inv_npoc, log_npoc, logR_obs, logR_mech, dR),
+                is.finite))
+
+nrow(kgml_base)
+```
+
+## 2. Cross-Validation and Model-Fitting Helpers
+
+These helper functions are used throughout script 03.
+They enforce site-safe validation, perform fold-wise imputation/scaling, and fit RF, XGBoost, and GAM models.
+The important design choice is that preprocessing happens inside each training fold to avoid leakage.
+
+```{r grouped-cv-helper}
+set.seed(42)
+
+make_group_folds <- function(dat, v = 5, repeats = 10, seed = 42) {
+  set.seed(seed)
+  group_vfold_cv(dat, group = site, v = v, repeats = repeats)
+}
+
+make_loso_folds <- function(dat) {
+  sites <- sort(unique(dat$site))
+  splits <- lapply(sites, function(s) {
+    make_splits(
+      list(analysis = which(dat$site != s), assessment = which(dat$site == s)),
+      dat
+    )
+  })
+
+  tibble(splits = splits, id = paste0("LOSO_", sites))
+}
+
+fold_id <- function(folds, i) {
+  id <- if ("id" %in% names(folds)) as.character(folds$id[[i]]) else paste0("Fold", i)
+  if ("id2" %in% names(folds)) id <- paste(id, as.character(folds$id2[[i]]), sep = "_")
+  id
+}
+
+mean_impute_from_train_03 <- function(train_df, test_df, predictors) {
+  train_out <- train_df
+  test_out <- test_df
+
+  for (nm in predictors) {
+    fill <- mean(train_out[[nm]], na.rm = TRUE)
+    if (!is.finite(fill)) fill <- 0
+    train_out[[nm]][!is.finite(train_out[[nm]]) | is.na(train_out[[nm]])] <- fill
+    test_out[[nm]][!is.finite(test_out[[nm]]) | is.na(test_out[[nm]])] <- fill
+  }
+
+  list(train = train_out, test = test_out)
+}
+
+scale_from_train_03 <- function(train_df, test_df, predictors) {
+  train_out <- train_df
+  test_out <- test_df
+
+  for (nm in predictors) {
+    center <- mean(train_out[[nm]], na.rm = TRUE)
+    spread <- sd(train_out[[nm]], na.rm = TRUE)
+    if (!is.finite(center)) center <- 0
+    if (!is.finite(spread) || spread == 0) spread <- 1
+    train_out[[nm]] <- (train_out[[nm]] - center) / spread
+    test_out[[nm]] <- (test_out[[nm]] - center) / spread
+  }
+
+  list(train = train_out, test = test_out)
+}
+
+fit_rf_cv <- function(dat, predictors, label, folds, response = "dR",
+                      prediction_type = c("kgml", "direct")) {
+  prediction_type <- match.arg(prediction_type)
+  formula <- reformulate(predictors, response = "dR")
+
+  results <- vector("list", nrow(folds))
+  importance <- vector("list", nrow(folds))
+
+  for (i in seq_len(nrow(folds))) {
+    train_data <- analysis(folds$splits[[i]])
+    test_data <- assessment(folds$splits[[i]])
+
+    fixed <- mean_impute_from_train_03(train_data, test_data, predictors)
+    formula <- reformulate(predictors, response = response)
+
+    rf_fit <- ranger(
+      formula = formula,
+      data = fixed$train,
+      num.trees = 800,
+      min.node.size = 5,
+      importance = "permutation",
+      seed = 7
+    )
+
+    y_hat <- predict(rf_fit, data = fixed$test)$predictions
+    logR_pred <- if (prediction_type == "kgml") test_data$logR_mech + y_hat else y_hat
+
+    results[[i]] <- test_data %>%
+      mutate(
+        fold_id = fold_id(folds, i),
+        model = label,
+        dR_hat = logR_pred - logR_mech,
+        logR_pred = logR_pred
+      )
+
+    importance[[i]] <- rf_fit$variable.importance
+  }
+
+  list(
+    predictions = bind_rows(results),
+    importance = importance
+  )
+}
+
+fit_lm_cv <- function(dat, predictors, label, folds) {
+  results <- vector("list", nrow(folds))
+
+  for (i in seq_len(nrow(folds))) {
+    train_data <- analysis(folds$splits[[i]])
+    test_data <- assessment(folds$splits[[i]])
+    fixed <- mean_impute_from_train_03(train_data, test_data, predictors)
+
+    fit <- lm(reformulate(predictors, response = "logR_obs"), data = fixed$train)
+    logR_pred <- as.numeric(predict(fit, newdata = fixed$test))
+
+    results[[i]] <- test_data %>%
+      mutate(
+        fold_id = fold_id(folds, i),
+        model = label,
+        dR_hat = logR_pred - logR_mech,
+        logR_pred = logR_pred
+      )
+  }
+
+  bind_rows(results)
+}
+
+fit_xgb_cv <- function(dat, predictors, label, folds, response = "logR_obs",
+                       prediction_type = c("direct", "kgml")) {
+  prediction_type <- match.arg(prediction_type)
+  results <- vector("list", nrow(folds))
+
+  for (i in seq_len(nrow(folds))) {
+    train_data <- analysis(folds$splits[[i]])
+    test_data <- assessment(folds$splits[[i]])
+    fixed <- mean_impute_from_train_03(train_data, test_data, predictors)
+    scaled <- scale_from_train_03(fixed$train, fixed$test, predictors)
+
+    dtrain <- xgb.DMatrix(
+      data = as.matrix(scaled$train[, predictors, drop = FALSE]),
+      label = scaled$train[[response]]
+    )
+    dtest <- xgb.DMatrix(data = as.matrix(scaled$test[, predictors, drop = FALSE]))
+
+    set.seed(7)
+    fit <- xgb.train(
+      params = list(
+        objective = "reg:squarederror",
+        eta = 0.04,
+        max_depth = 2,
+        subsample = 0.8,
+        colsample_bytree = 0.8,
+        min_child_weight = 3
+      ),
+      data = dtrain,
+      nrounds = 120,
+      verbose = 0
+    )
+
+    y_hat <- as.numeric(predict(fit, dtest))
+    logR_pred <- if (prediction_type == "kgml") test_data$logR_mech + y_hat else y_hat
+
+    results[[i]] <- test_data %>%
+      mutate(
+        fold_id = fold_id(folds, i),
+        model = label,
+        dR_hat = logR_pred - logR_mech,
+        logR_pred = logR_pred
+      )
+  }
+
+  bind_rows(results)
+}
+
+fit_gam_cv <- function(dat, folds) {
+  results <- vector("list", nrow(folds))
+
+  for (i in seq_len(nrow(folds))) {
+    train_data <- analysis(folds$splits[[i]])
+    test_data <- assessment(folds$splits[[i]])
+
+    gam_fit <- gam(dR ~ s(log_npoc, k = 5), data = train_data, method = "REML")
+    dR_hat <- predict(gam_fit, newdata = test_data)
+
+    results[[i]] <- test_data %>%
+      mutate(
+        fold_id = fold_id(folds, i),
+        model = "KGML GAM NPOC",
+        dR_hat = dR_hat,
+        logR_pred = logR_mech + dR_hat
+      )
+  }
+
+  bind_rows(results)
+}
+```
+
+## 3. Main KGML Models
+
+The following chunks fit the core KGML models used in Section 3.3.
+All KGML models learn `dR`, then add the learned correction back to the fixed-`Vh0` mechanistic prediction.
+
+### 3.1 KGML-NPOC
+
+This is the minimal residual-learning model.
+It tests whether the dominant mechanistic bias can be corrected using only NPOC and transformed NPOC terms.
+
+```{r npoc-only-kgml}
+folds_grouped <- make_group_folds(kgml_base)
+folds_loso <- make_loso_folds(kgml_base)
+
+npoc_predictors <- c("npoc", "inv_npoc", "log_npoc")
+rf_npoc <- fit_rf_cv(kgml_base, npoc_predictors, "KGML RF NPOC", folds_grouped)
+rf_npoc_loso <- fit_rf_cv(kgml_base, npoc_predictors, "KGML RF NPOC", folds_loso)
+pure_rf_npoc <- fit_rf_cv(
+  kgml_base, npoc_predictors, "Pure RF NPOC", folds_grouped,
+  response = "logR_obs", prediction_type = "direct"
+)
+pure_xgb_npoc <- fit_xgb_cv(
+  kgml_base, npoc_predictors, "Pure XGBoost NPOC", folds_grouped
+)
+pure_rf_npoc_loso <- fit_rf_cv(
+  kgml_base, npoc_predictors, "Pure RF NPOC", folds_loso,
+  response = "logR_obs", prediction_type = "direct"
+)
+pure_xgb_npoc_loso <- fit_xgb_cv(
+  kgml_base, npoc_predictors, "Pure XGBoost NPOC", folds_loso
+)
+
+cv_npoc <- rf_npoc$predictions
+cv_npoc_loso <- rf_npoc_loso$predictions
+```
+
+### 3.2 KGML-Bulk
+
+This model expands the residual-learning predictors to include NPOC, biomass, thermodynamic summaries, and grain-size/SSA variables.
+It is the main accessibility-focused KGML model.
+
+```{r expanded-kgml}
+expanded_predictors <- c(
+  "npoc", "inv_npoc", "log_npoc",
+  "biomass", "delGcat", "lambda", "ne", "stoichMet_donor",
+  "clay", "silt", "fine", "med", "coarse", "ssa_tot", "d50_mm"
+)
+
+kgml_expanded <- kgml_base %>%
+  filter(if_all(all_of(expanded_predictors), is.finite))
+
+folds_grouped_expanded <- make_group_folds(kgml_expanded)
+folds_loso_expanded <- make_loso_folds(kgml_expanded)
+
+rf_expanded <- fit_rf_cv(
+  kgml_expanded, expanded_predictors, "KGML RF expanded", folds_grouped_expanded
+)
+rf_expanded_loso <- fit_rf_cv(
+  kgml_expanded, expanded_predictors, "KGML RF expanded", folds_loso_expanded
+)
+cv_expanded <- rf_expanded$predictions
+cv_expanded_loso <- rf_expanded_loso$predictions
+```
+
+## 4. Pure Data-Driven Benchmarks
+
+These models predict `log10(R)` directly from the same bulk predictors used by KGML-Bulk.
+They are included to evaluate whether KGML is competitive with flexible empirical models and whether residual structure reflects system behavior rather than only the mechanistic model form.
+
+```{r pure-data-driven-models}
+pure_rf <- fit_rf_cv(
+  kgml_expanded, expanded_predictors, "Pure RF", folds_grouped_expanded,
+  response = "logR_obs", prediction_type = "direct"
+)
+pure_xgb <- fit_xgb_cv(
+  kgml_expanded, expanded_predictors, "Pure XGBoost", folds_grouped_expanded
+)
+
+pure_rf_loso <- fit_rf_cv(
+  kgml_expanded, expanded_predictors, "Pure RF", folds_loso_expanded,
+  response = "logR_obs", prediction_type = "direct"
+)
+pure_xgb_loso <- fit_xgb_cv(
+  kgml_expanded, expanded_predictors, "Pure XGBoost", folds_loso_expanded
+)
+```
+
+## 5. KGML-FTICR and Pure FTICR Benchmarks
+
+This section adds molecular summary features from FTICR-MS.
+`KGML-FTICR` learns residuals from NPOC plus FTICR summaries, while `Pure RF-FTICR` and `Pure XGBoost-FTICR` predict `log10(R)` directly from the same FTICR-oriented predictor set.
+Correlated FTICR predictors are removed within each training fold.
+
+```{r fticr-kgml}
+fticr_path <- raw_file("fticr_features.csv")
+
+if (file.exists(fticr_path)) {
+  ft <- read_csv(fticr_path, col_types = cols(site = col_character()))
+
+  fticr_cols <- c(
+    "n_peaks", "shannon",
+    "NOSC_med", "NOSC_iqr", "NOSC_mean", "NOSC_p10", "NOSC_p90", "NOSC_range90",
+    "DBE_med", "DBE_mean", "DBE_iqr",
+    "AI_med", "AI_iqr",
+    "delG_med", "delG_iqr",
+    "lambda_med", "lambda_iqr",
+    "Cnum_med", "Cnum_iqr",
+    "frac_NOSC_pos", "frac_NOSC_low", "frac_AI_high", "DBE_C_ratio_mean",
+    "frac_ConHC", "frac_Lipid", "frac_AminoSugar", "frac_Protein", "frac_Tannin",
+    "frac_UnsatHC", "frac_Lignin", "frac_Carb", "frac_Other",
+    "ratio_Protein_Lignin", "ratio_Lipid_Carb", "ratio_UnsatHC_ConHC"
+  )
+
+  fticr_available <- intersect(fticr_cols, names(ft))
+
+  kgml_ft <- kgml_base %>%
+    left_join(ft %>% select(site, Position, all_of(fticr_available)),
+              by = c("site", "Position")) %>%
+    filter(if_all(all_of(c(npoc_predictors, fticr_available)), is.finite))
+
+  # Correlation filtering is intentionally inside each fold to avoid leakage.
+  folds <- make_group_folds(kgml_ft)
+  folds_ft_loso <- make_loso_folds(kgml_ft)
+  results <- vector("list", nrow(folds))
+  importance <- vector("list", nrow(folds))
+
+  for (i in seq_len(nrow(folds))) {
+    train_data <- analysis(folds$splits[[i]])
+    test_data <- assessment(folds$splits[[i]])
+
+    corr_mat <- cor(train_data[, fticr_available], use = "pairwise.complete.obs")
+    high_corr <- findCorrelation(corr_mat, cutoff = 0.80)
+    fticr_reduced <- if (length(high_corr) > 0) fticr_available[-high_corr] else fticr_available
+    predictors <- c(npoc_predictors, fticr_reduced)
+    formula <- reformulate(predictors, response = "dR")
+
+    rf_fit <- ranger(
+      formula = formula,
+      data = train_data,
+      num.trees = 800,
+      min.node.size = 5,
+      importance = "permutation",
+      seed = 7
+    )
+
+    dR_hat <- predict(rf_fit, data = test_data)$predictions
+    results[[i]] <- test_data %>%
+      mutate(
+        fold_id = fold_id(folds, i),
+        model = "KGML RF FTICR",
+        dR_hat = dR_hat,
+        logR_pred = logR_mech + dR_hat
+      )
+    importance[[i]] <- rf_fit$variable.importance
+  }
+
+  cv_ft <- bind_rows(results)
+
+  loso_results <- vector("list", nrow(folds_ft_loso))
+
+  for (i in seq_len(nrow(folds_ft_loso))) {
+    train_data <- analysis(folds_ft_loso$splits[[i]])
+    test_data <- assessment(folds_ft_loso$splits[[i]])
+
+    corr_mat <- cor(train_data[, fticr_available], use = "pairwise.complete.obs")
+    high_corr <- findCorrelation(corr_mat, cutoff = 0.80)
+    fticr_reduced <- if (length(high_corr) > 0) fticr_available[-high_corr] else fticr_available
+    predictors <- c(npoc_predictors, fticr_reduced)
+    formula <- reformulate(predictors, response = "dR")
+
+    fixed <- mean_impute_from_train_03(train_data, test_data, predictors)
+
+    rf_fit <- ranger(
+      formula = formula,
+      data = fixed$train,
+      num.trees = 800,
+      min.node.size = 5,
+      importance = "permutation",
+      seed = 7
+    )
+
+    dR_hat <- predict(rf_fit, data = fixed$test)$predictions
+    loso_results[[i]] <- test_data %>%
+      mutate(
+        fold_id = fold_id(folds_ft_loso, i),
+        model = "KGML RF FTICR",
+        dR_hat = dR_hat,
+        logR_pred = logR_mech + dR_hat
+      )
+  }
+
+  cv_ft_loso <- bind_rows(loso_results)
+
+  fit_pure_fticr_cv <- function(dat, label, folds, engine = c("rf", "xgb")) {
+    engine <- match.arg(engine)
+    results <- vector("list", nrow(folds))
+
+    for (i in seq_len(nrow(folds))) {
+      train_data <- analysis(folds$splits[[i]])
+      test_data <- assessment(folds$splits[[i]])
+
+      corr_mat <- cor(train_data[, fticr_available], use = "pairwise.complete.obs")
+      high_corr <- findCorrelation(corr_mat, cutoff = 0.80)
+      fticr_reduced <- if (length(high_corr) > 0) fticr_available[-high_corr] else fticr_available
+      predictors <- c(npoc_predictors, fticr_reduced)
+      fixed <- mean_impute_from_train_03(train_data, test_data, predictors)
+
+      if (engine == "rf") {
+        rf_fit <- ranger(
+          formula = reformulate(predictors, response = "logR_obs"),
+          data = fixed$train,
+          num.trees = 800,
+          min.node.size = 5,
+          importance = "permutation",
+          seed = 7
+        )
+        logR_pred <- predict(rf_fit, data = fixed$test)$predictions
+      } else {
+        scaled <- scale_from_train_03(fixed$train, fixed$test, predictors)
+        dtrain <- xgb.DMatrix(
+          data = as.matrix(scaled$train[, predictors, drop = FALSE]),
+          label = scaled$train$logR_obs
+        )
+        dtest <- xgb.DMatrix(
+          data = as.matrix(scaled$test[, predictors, drop = FALSE])
+        )
+
+        set.seed(7)
+        xgb_fit <- xgb.train(
+          params = list(
+            objective = "reg:squarederror",
+            eta = 0.04,
+            max_depth = 2,
+            subsample = 0.8,
+            colsample_bytree = 0.8,
+            min_child_weight = 3
+          ),
+          data = dtrain,
+          nrounds = 120,
+          verbose = 0
+        )
+        logR_pred <- as.numeric(predict(xgb_fit, dtest))
+      }
+
+      results[[i]] <- test_data %>%
+        mutate(
+          fold_id = fold_id(folds, i),
+          model = label,
+          dR_hat = logR_pred - logR_mech,
+          logR_pred = logR_pred
+        )
+    }
+
+    bind_rows(results)
+  }
+
+  pure_rf_fticr <- fit_pure_fticr_cv(
+    kgml_ft, "Pure RF-FTICR", folds, engine = "rf"
+  )
+  pure_xgb_fticr <- fit_pure_fticr_cv(
+    kgml_ft, "Pure XGBoost-FTICR", folds, engine = "xgb"
+  )
+  pure_rf_fticr_loso <- fit_pure_fticr_cv(
+    kgml_ft, "Pure RF-FTICR", folds_ft_loso, engine = "rf"
+  )
+  pure_xgb_fticr_loso <- fit_pure_fticr_cv(
+    kgml_ft, "Pure XGBoost-FTICR", folds_ft_loso, engine = "xgb"
+  )
+
+  write_csv(cv_ft, derived_file("kgml_fticr_cv_predictions.csv"))
+  write_csv(cv_ft_loso, derived_file("kgml_fticr_loso_predictions.csv"))
+  write_csv(pure_rf_fticr, derived_file("pure_rf_fticr_cv_predictions.csv"))
+  write_csv(pure_xgb_fticr, derived_file("pure_xgboost_fticr_cv_predictions.csv"))
+  write_csv(pure_rf_fticr_loso, derived_file("pure_rf_fticr_loso_predictions.csv"))
+  write_csv(pure_xgb_fticr_loso, derived_file("pure_xgboost_fticr_loso_predictions.csv"))
+
+  cv_ft
+}
+```
+
+## 6. Bulk+FTICR Upper-Bound Sensitivity
+
+This sensitivity combines the bulk predictor set and FTICR molecular summaries.
+It asks whether KGML improves simply by increasing predictor dimensionality.
+Use this section as an upper-bound or supplement analysis, not as the primary model comparison.
+
+```{r bulk-fticr-sensitivity}
+if (exists("kgml_ft")) {
+  kgml_bulk_ft <- kgml_expanded %>%
+    left_join(ft %>% select(site, Position, all_of(fticr_available)),
+              by = c("site", "Position")) %>%
+    filter(if_all(all_of(fticr_available), is.finite))
+
+  folds_grouped_bulk_ft <- make_group_folds(kgml_bulk_ft)
+  folds_loso_bulk_ft <- make_loso_folds(kgml_bulk_ft)
+
+  fit_bulk_fticr_cv <- function(dat, label, folds,
+                                response = c("dR", "logR_obs"),
+                                prediction_type = c("kgml", "direct"),
+                                engine = c("rf", "xgb")) {
+    response <- match.arg(response)
+    prediction_type <- match.arg(prediction_type)
+    engine <- match.arg(engine)
+    results <- vector("list", nrow(folds))
+
+    for (i in seq_len(nrow(folds))) {
+      train_data <- analysis(folds$splits[[i]])
+      test_data <- assessment(folds$splits[[i]])
+
+      corr_mat <- cor(train_data[, fticr_available], use = "pairwise.complete.obs")
+      high_corr <- findCorrelation(corr_mat, cutoff = 0.80)
+      fticr_reduced <- if (length(high_corr) > 0) {
+        fticr_available[-high_corr]
+      } else {
+        fticr_available
+      }
+      predictors <- unique(c(expanded_predictors, fticr_reduced))
+      fixed <- mean_impute_from_train_03(train_data, test_data, predictors)
+
+      if (engine == "rf") {
+        rf_fit <- ranger(
+          formula = reformulate(predictors, response = response),
+          data = fixed$train,
+          num.trees = 800,
+          min.node.size = 5,
+          importance = "permutation",
+          seed = 7
+        )
+        y_hat <- predict(rf_fit, data = fixed$test)$predictions
+      } else {
+        scaled <- scale_from_train_03(fixed$train, fixed$test, predictors)
+        dtrain <- xgb.DMatrix(
+          data = as.matrix(scaled$train[, predictors, drop = FALSE]),
+          label = scaled$train[[response]]
+        )
+        dtest <- xgb.DMatrix(
+          data = as.matrix(scaled$test[, predictors, drop = FALSE])
+        )
+
+        set.seed(7)
+        xgb_fit <- xgb.train(
+          params = list(
+            objective = "reg:squarederror",
+            eta = 0.04,
+            max_depth = 2,
+            subsample = 0.8,
+            colsample_bytree = 0.8,
+            min_child_weight = 3
+          ),
+          data = dtrain,
+          nrounds = 120,
+          verbose = 0
+        )
+        y_hat <- as.numeric(predict(xgb_fit, dtest))
+      }
+
+      logR_pred <- if (prediction_type == "kgml") test_data$logR_mech + y_hat else y_hat
+
+      results[[i]] <- test_data %>%
+        mutate(
+          fold_id = fold_id(folds, i),
+          model = label,
+          dR_hat = logR_pred - logR_mech,
+          logR_pred = logR_pred
+        )
+    }
+
+    bind_rows(results)
+  }
+
+  bulk_fticr_predictions <- bind_rows(
+    fit_bulk_fticr_cv(
+      kgml_bulk_ft, "KGML-Bulk+FTICR", folds_grouped_bulk_ft,
+      response = "dR", prediction_type = "kgml", engine = "rf"
+    ) %>%
+      mutate(Validation = "Site-grouped 5-fold CV"),
+    fit_bulk_fticr_cv(
+      kgml_bulk_ft, "Pure RF-Bulk+FTICR", folds_grouped_bulk_ft,
+      response = "logR_obs", prediction_type = "direct", engine = "rf"
+    ) %>%
+      mutate(Validation = "Site-grouped 5-fold CV"),
+    fit_bulk_fticr_cv(
+      kgml_bulk_ft, "Pure XGBoost-Bulk+FTICR", folds_grouped_bulk_ft,
+      response = "logR_obs", prediction_type = "direct", engine = "xgb"
+    ) %>%
+      mutate(Validation = "Site-grouped 5-fold CV"),
+    fit_bulk_fticr_cv(
+      kgml_bulk_ft, "KGML-Bulk+FTICR", folds_loso_bulk_ft,
+      response = "dR", prediction_type = "kgml", engine = "rf"
+    ) %>%
+      mutate(Validation = "Leave-one-site-out CV"),
+    fit_bulk_fticr_cv(
+      kgml_bulk_ft, "Pure RF-Bulk+FTICR", folds_loso_bulk_ft,
+      response = "logR_obs", prediction_type = "direct", engine = "rf"
+    ) %>%
+      mutate(Validation = "Leave-one-site-out CV"),
+    fit_bulk_fticr_cv(
+      kgml_bulk_ft, "Pure XGBoost-Bulk+FTICR", folds_loso_bulk_ft,
+      response = "logR_obs", prediction_type = "direct", engine = "xgb"
+    ) %>%
+      mutate(Validation = "Leave-one-site-out CV")
+  ) %>%
+    select(Validation, model, fold_id, site, Position, respC, npoc, inv_npoc,
+           log_npoc, logR_obs, logR_mech, dR, dR_hat, logR_pred)
+
+  bulk_fticr_stats <- bulk_fticr_predictions %>%
+    group_by(Validation, model) %>%
+    group_modify(~ model_stats(.x$logR_obs, .x$logR_pred)) %>%
+    ungroup() %>%
+    rename(Model = model) %>%
+    mutate(
+      Dataset = "Bulk+FTICR",
+      Model_class = case_when(
+        str_detect(Model, "^KGML") ~ "KGML",
+        TRUE ~ "Pure data-driven"
+      )
+    ) %>%
+    select(Validation, Dataset, Model_class, Model,
+           n, RMSE, Pearson_r, CCC, Bias, R2)
+
+  write_csv(bulk_fticr_predictions,
+            derived_file("kgml_bulk_fticr_sensitivity_predictions.csv"))
+  write_csv(bulk_fticr_stats,
+            derived_file("kgml_bulk_fticr_sensitivity_stats.csv"))
+
+  p_bulk_fticr_sensitivity <- bulk_fticr_stats %>%
+    select(Validation, Model_class, Model, RMSE, Pearson_r, CCC) %>%
+    pivot_longer(c(RMSE, Pearson_r, CCC),
+                 names_to = "Metric", values_to = "Value") %>%
+    mutate(
+      Metric = recode(Metric, Pearson_r = "Pearson r"),
+      Metric = factor(Metric, levels = c("RMSE", "Pearson r", "CCC")),
+      Model = factor(Model, levels = rev(c(
+        "KGML-Bulk+FTICR",
+        "Pure RF-Bulk+FTICR",
+        "Pure XGBoost-Bulk+FTICR"
+      )))
+    ) %>%
+    ggplot(aes(x = Value, y = Model, color = Model_class)) +
+    geom_segment(aes(x = 0, xend = Value, yend = Model),
+                 linewidth = 0.6, alpha = 0.75) +
+    geom_point(size = 2.4) +
+    facet_grid(Validation ~ Metric, scales = "free_x") +
+    scale_color_manual(values = c(
+      "KGML" = puor$purple,
+      "Pure data-driven" = puor$orange
+    )) +
+    labs(x = NULL, y = NULL, color = NULL) +
+    theme_review() +
+    theme(
+      legend.position = "top",
+      panel.grid.major.y = element_blank(),
+      strip.text = element_text(face = "bold")
+    )
+
+  ggsave(figure_file("kgml_bulk_fticr_sensitivity_lollipop.pdf"),
+         p_bulk_fticr_sensitivity, width = 8.5, height = 4.2)
+
+  bulk_fticr_stats
+}
+```
+
+### 6.1 Bulk+FTICR RF vs GAM Correction Function
+
+This figure compares the RF residual correction against a simpler GAM approximation in the Bulk+FTICR setting.
+Because Bulk+FTICR is multidimensional, the curve is projected along `log10(NPOC)` rather than being a true one-variable function.
+The GAM uses key bulk predictors plus fold-wise FTICR PCA axes.
+
+```{r bulk-fticr-rf-gam-correction-function}
+if (exists("kgml_bulk_ft")) {
+  fit_bulk_fticr_gam_correction_cv <- function(dat, folds) {
+    gam_bulk_predictors <- c("log_npoc", "biomass", "stoichMet_donor",
+                             "ssa_tot", "d50_mm")
+    results <- vector("list", nrow(folds))
+
+    for (i in seq_len(nrow(folds))) {
+      train_data <- analysis(folds$splits[[i]])
+      test_data <- assessment(folds$splits[[i]])
+
+      fixed_fticr <- mean_impute_from_train_03(train_data, test_data,
+                                               fticr_available)
+      fticr_scaled <- scale_from_train_03(fixed_fticr$train,
+                                          fixed_fticr$test,
+                                          fticr_available)
+
+      pca_fit <- prcomp(fticr_scaled$train[, fticr_available, drop = FALSE],
+                        center = FALSE, scale. = FALSE)
+      n_pc <- min(2, ncol(pca_fit$x))
+      train_pc <- as.data.frame(pca_fit$x[, seq_len(n_pc), drop = FALSE])
+      test_pc <- as.data.frame(
+        predict(pca_fit,
+                newdata = fticr_scaled$test[, fticr_available, drop = FALSE])[
+                  , seq_len(n_pc), drop = FALSE
+                ]
+      )
+      names(train_pc) <- paste0("fticr_pc", seq_len(n_pc))
+      names(test_pc) <- paste0("fticr_pc", seq_len(n_pc))
+
+      train_model <- bind_cols(train_data, train_pc)
+      test_model <- bind_cols(test_data, test_pc)
+
+      gam_predictors <- c(gam_bulk_predictors, names(train_pc))
+      fixed_model <- mean_impute_from_train_03(train_model, test_model,
+                                               gam_predictors)
+
+      gam_formula <- reformulate(
+        paste0("s(", gam_predictors, ", k = 4)"),
+        response = "dR"
+      )
+
+      gam_fit <- gam(gam_formula, data = fixed_model$train,
+                     method = "REML", select = TRUE)
+      dR_hat <- as.numeric(predict(gam_fit, newdata = fixed_model$test))
+
+      results[[i]] <- test_data %>%
+        mutate(
+          fold_id = fold_id(folds, i),
+          model = "GAM Bulk+FTICR",
+          dR_hat = dR_hat,
+          logR_pred = logR_mech + dR_hat
+        )
+    }
+
+    bind_rows(results)
+  }
+
+  gam_bulk_fticr_correction <- fit_bulk_fticr_gam_correction_cv(
+    kgml_bulk_ft, folds_grouped_bulk_ft
+  )
+
+  rf_bulk_fticr_correction <- bulk_fticr_predictions %>%
+    filter(Validation == "Site-grouped 5-fold CV",
+           model == "KGML-Bulk+FTICR")
+
+  bulk_fticr_correction_lines <- bind_rows(
+    rf_bulk_fticr_correction %>%
+      transmute(site, Position, log_npoc, Model = "RF", dR_hat),
+    gam_bulk_fticr_correction %>%
+      transmute(site, Position, log_npoc, Model = "GAM", dR_hat)
+  ) %>%
+    group_by(Model, site, Position) %>%
+    summarise(
+      log_npoc = mean(log_npoc, na.rm = TRUE),
+      dR_hat = mean(dR_hat, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  bulk_fticr_correction_smooth <- bulk_fticr_correction_lines %>%
+    group_by(Model) %>%
+    group_modify(~ {
+      x_grid <- tibble(
+        log_npoc = seq(min(.x$log_npoc, na.rm = TRUE),
+                       max(.x$log_npoc, na.rm = TRUE),
+                       length.out = 120)
+      )
+      fit <- loess(dR_hat ~ log_npoc, span = 0.65, data = .x)
+      x_grid %>%
+        mutate(dR_hat = as.numeric(predict(fit, newdata = x_grid)))
+    }) %>%
+    ungroup()
+
+  bulk_fticr_correction_points <- kgml_bulk_ft %>%
+    distinct(site, Position, log_npoc, dR)
+
+  write_csv(bulk_fticr_correction_lines,
+            derived_file("kgml_bulk_fticr_rf_gam_correction_points.csv"))
+  write_csv(bulk_fticr_correction_smooth,
+            derived_file("kgml_bulk_fticr_rf_gam_correction_function.csv"))
+  write_csv(gam_bulk_fticr_correction,
+            derived_file("kgml_bulk_fticr_gam_correction_predictions.csv"))
+
+  p_bulk_fticr_correction <- ggplot() +
+    geom_point(
+      data = bulk_fticr_correction_points,
+      aes(x = log_npoc, y = dR),
+      color = "grey65", alpha = 0.55, size = 1.5
+    ) +
+    geom_line(
+      data = bulk_fticr_correction_smooth,
+      aes(x = log_npoc, y = dR_hat, color = Model),
+      linewidth = 0.9
+    ) +
+    scale_color_manual(values = c(GAM = puor$purple, RF = puor$orange)) +
+    labs(x = expression(log[10](NPOC)),
+         y = "Residual correction (dR)",
+         color = "Model") +
+    theme_review()
+
+  ggsave(figure_file("kgml_bulk_fticr_rf_gam_correction_function.pdf"),
+         p_bulk_fticr_correction, width = 4.2, height = 3.4)
+
+  p_bulk_fticr_correction
+}
+```
+
+## 7. Predictor Manifest
+
+This chunk writes a plain CSV that records each model's dataset, target, sample/site count, and predictor list.
+Use this file when checking whether a model is a bulk, FTICR, or Bulk+FTICR comparison.
+
+
+
+
+```{r predictor-manifest}
+predictor_manifest <- bind_rows(
+  tibble(
+    Model = "KGML-NPOC",
+    Dataset = "kgml_base",
+    Target = "Residual dR",
+    samples = nrow(kgml_base),
+    sites = n_distinct(kgml_base$site),
+    predictors = paste(npoc_predictors, collapse = "; "),
+    note = ""
+  ),
+  tibble(
+    Model = "KGML-Bulk",
+    Dataset = "kgml_expanded",
+    Target = "Residual dR",
+    samples = nrow(kgml_expanded),
+    sites = n_distinct(kgml_expanded$site),
+    predictors = paste(expanded_predictors, collapse = "; "),
+    note = ""
+  ),
+  tibble(
+    Model = "Pure RF-Bulk",
+    Dataset = "kgml_expanded",
+    Target = "Observed log10(R)",
+    samples = nrow(kgml_expanded),
+    sites = n_distinct(kgml_expanded$site),
+    predictors = paste(expanded_predictors, collapse = "; "),
+    note = ""
+  ),
+  tibble(
+    Model = "Pure XGBoost-Bulk",
+    Dataset = "kgml_expanded",
+    Target = "Observed log10(R)",
+    samples = nrow(kgml_expanded),
+    sites = n_distinct(kgml_expanded$site),
+    predictors = paste(expanded_predictors, collapse = "; "),
+    note = ""
+  )
+)
+
+if (exists("kgml_ft")) {
+  predictor_manifest <- bind_rows(
+    predictor_manifest,
+    tibble(
+      Model = "KGML-FTICR",
+      Dataset = "kgml_ft",
+      Target = "Residual dR",
+      samples = nrow(kgml_ft),
+      sites = n_distinct(kgml_ft$site),
+      predictors = paste(c(npoc_predictors, fticr_available), collapse = "; "),
+      note = "FTICR predictors are filtered for high correlation within each training fold."
+    ),
+    tibble(
+      Model = "Pure RF-FTICR",
+      Dataset = "kgml_ft",
+      Target = "Observed log10(R)",
+      samples = nrow(kgml_ft),
+      sites = n_distinct(kgml_ft$site),
+      predictors = paste(c(npoc_predictors, fticr_available), collapse = "; "),
+      note = "FTICR predictors are filtered for high correlation within each training fold."
+    ),
+    tibble(
+      Model = "Pure XGBoost-FTICR",
+      Dataset = "kgml_ft",
+      Target = "Observed log10(R)",
+      samples = nrow(kgml_ft),
+      sites = n_distinct(kgml_ft$site),
+      predictors = paste(c(npoc_predictors, fticr_available), collapse = "; "),
+      note = "FTICR predictors are filtered for high correlation within each training fold."
+    )
+  )
+}
+
+write_csv(predictor_manifest,
+          derived_file("kgml_model_predictor_manifest.csv"))
+
+predictor_manifest
+```
+
+## 8. NPOC Term Sensitivity
+
+This diagnostic tests how much KGML-Bulk and KGML-FTICR depend on NPOC-related predictors.
+It compares three predictor settings: no NPOC terms, raw `npoc` only, and the full transformed NPOC predictor set (`npoc`, `inv_npoc`, and `log_npoc`).
+The output figure is useful as a supplement for showing whether model performance is driven by the NPOC terms alone.
+
+```{r npoc-transform-ablation}
+npoc_transform_ablation_predictions <- bind_rows(
+  fit_rf_cv(
+    kgml_expanded,
+    expanded_predictors,
+    "KGML-Bulk full NPOC transforms",
+    folds_grouped_expanded
+  )$predictions %>%
+    mutate(Validation = "Site-grouped 5-fold CV"),
+  fit_rf_cv(
+    kgml_expanded,
+    setdiff(expanded_predictors, c("inv_npoc", "log_npoc")),
+    "KGML-Bulk raw NPOC only",
+    folds_grouped_expanded
+  )$predictions %>%
+    mutate(Validation = "Site-grouped 5-fold CV"),
+  fit_rf_cv(
+    kgml_expanded,
+    setdiff(expanded_predictors, c("npoc", "inv_npoc", "log_npoc")),
+    "KGML-Bulk no NPOC terms",
+    folds_grouped_expanded
+  )$predictions %>%
+    mutate(Validation = "Site-grouped 5-fold CV"),
+  fit_rf_cv(
+    kgml_expanded,
+    expanded_predictors,
+    "KGML-Bulk full NPOC transforms",
+    folds_loso_expanded
+  )$predictions %>%
+    mutate(Validation = "Leave-one-site-out CV"),
+  fit_rf_cv(
+    kgml_expanded,
+    setdiff(expanded_predictors, c("inv_npoc", "log_npoc")),
+    "KGML-Bulk raw NPOC only",
+    folds_loso_expanded
+  )$predictions %>%
+    mutate(Validation = "Leave-one-site-out CV"),
+  fit_rf_cv(
+    kgml_expanded,
+    setdiff(expanded_predictors, c("npoc", "inv_npoc", "log_npoc")),
+    "KGML-Bulk no NPOC terms",
+    folds_loso_expanded
+  )$predictions %>%
+    mutate(Validation = "Leave-one-site-out CV")
+)
+
+if (exists("kgml_ft")) {
+  fticr_full_predictors <- c(npoc_predictors, fticr_available)
+  fticr_raw_npoc_predictors <- c("npoc", fticr_available)
+  fticr_no_npoc_predictors <- fticr_available
+
+  fit_fticr_ablation <- function(dat, predictors, label, folds) {
+    results <- vector("list", nrow(folds))
+
+    for (i in seq_len(nrow(folds))) {
+      train_data <- analysis(folds$splits[[i]])
+      test_data <- assessment(folds$splits[[i]])
+
+      fticr_in_model <- intersect(fticr_available, predictors)
+      if (length(fticr_in_model) > 1) {
+        corr_mat <- cor(train_data[, fticr_in_model], use = "pairwise.complete.obs")
+        high_corr <- findCorrelation(corr_mat, cutoff = 0.80)
+        fticr_reduced <- if (length(high_corr) > 0) {
+          fticr_in_model[-high_corr]
+        } else {
+          fticr_in_model
+        }
+      } else {
+        fticr_in_model
+      }
+
+      predictors_fold <- unique(c(intersect(c("npoc", "inv_npoc", "log_npoc"),
+                                            predictors),
+                                  fticr_reduced))
+      fixed <- mean_impute_from_train_03(train_data, test_data, predictors_fold)
+
+      rf_fit <- ranger(
+        formula = reformulate(predictors_fold, response = "dR"),
+        data = fixed$train,
+        num.trees = 800,
+        min.node.size = 5,
+        importance = "permutation",
+        seed = 7
+      )
+
+      dR_hat <- predict(rf_fit, data = fixed$test)$predictions
+      results[[i]] <- test_data %>%
+        mutate(
+          fold_id = fold_id(folds, i),
+          model = label,
+          dR_hat = dR_hat,
+          logR_pred = logR_mech + dR_hat
+        )
+    }
+
+    bind_rows(results)
+  }
+
+  npoc_transform_ablation_predictions <- bind_rows(
+    npoc_transform_ablation_predictions,
+    fit_fticr_ablation(
+      kgml_ft, fticr_full_predictors,
+      "KGML-FTICR full NPOC transforms", folds
+    ) %>%
+      mutate(Validation = "Site-grouped 5-fold CV"),
+    fit_fticr_ablation(
+      kgml_ft, fticr_raw_npoc_predictors,
+      "KGML-FTICR raw NPOC only", folds
+    ) %>%
+      mutate(Validation = "Site-grouped 5-fold CV"),
+    fit_fticr_ablation(
+      kgml_ft, fticr_no_npoc_predictors,
+      "KGML-FTICR no NPOC terms", folds
+    ) %>%
+      mutate(Validation = "Site-grouped 5-fold CV"),
+    fit_fticr_ablation(
+      kgml_ft, fticr_full_predictors,
+      "KGML-FTICR full NPOC transforms", folds_ft_loso
+    ) %>%
+      mutate(Validation = "Leave-one-site-out CV"),
+    fit_fticr_ablation(
+      kgml_ft, fticr_raw_npoc_predictors,
+      "KGML-FTICR raw NPOC only", folds_ft_loso
+    ) %>%
+      mutate(Validation = "Leave-one-site-out CV"),
+    fit_fticr_ablation(
+      kgml_ft, fticr_no_npoc_predictors,
+      "KGML-FTICR no NPOC terms", folds_ft_loso
+    ) %>%
+      mutate(Validation = "Leave-one-site-out CV")
+  )
+}
+
+npoc_transform_ablation_predictions <- npoc_transform_ablation_predictions %>%
+  select(Validation, model, fold_id, site, Position, respC, npoc, inv_npoc,
+         log_npoc, logR_obs, logR_mech, dR, dR_hat, logR_pred)
+
+npoc_transform_ablation_stats <- npoc_transform_ablation_predictions %>%
+  group_by(Validation, model) %>%
+  group_modify(~ model_stats(.x$logR_obs, .x$logR_pred)) %>%
+  ungroup() %>%
+  rename(Model = model) %>%
+  mutate(
+    Model_family = case_when(
+      str_detect(Model, "Bulk") ~ "KGML-Bulk",
+      str_detect(Model, "FTICR") ~ "KGML-FTICR",
+      TRUE ~ Model
+    ),
+    NPOC_setting = case_when(
+      str_detect(Model, "no NPOC") ~ "no NPOC terms",
+      str_detect(Model, "full") ~ "npoc + inv_npoc + log_npoc",
+      str_detect(Model, "raw") ~ "npoc only",
+      TRUE ~ Model
+    )
+  ) %>%
+  select(Validation, Model_family, NPOC_setting, Model,
+         n, RMSE, Pearson_r, CCC, Bias, R2)
+
+write_csv(npoc_transform_ablation_predictions,
+          derived_file("kgml_npoc_transform_ablation_predictions.csv"))
+write_csv(npoc_transform_ablation_stats,
+          derived_file("kgml_npoc_transform_ablation_stats.csv"))
+write_csv(npoc_transform_ablation_stats,
+          derived_file("kgml_npoc_term_sensitivity_stats.csv"))
+
+p_npoc_transform_ablation <- npoc_transform_ablation_stats %>%
+  select(Validation, Model_family, NPOC_setting, RMSE, Pearson_r, CCC) %>%
+  pivot_longer(c(RMSE, Pearson_r, CCC),
+               names_to = "Metric", values_to = "Value") %>%
+  mutate(
+    Metric = recode(Metric, Pearson_r = "Pearson r"),
+    Metric = factor(Metric, levels = c("RMSE", "Pearson r", "CCC")),
+    NPOC_setting = factor(NPOC_setting,
+                          levels = c("no NPOC terms", "npoc only",
+                                     "npoc + inv_npoc + log_npoc"))
+  ) %>%
+  ggplot(aes(x = NPOC_setting, y = Value, color = Model_family,
+             group = Model_family)) +
+  geom_line(linewidth = 0.65) +
+  geom_point(size = 2.2) +
+  facet_grid(Validation ~ Metric, scales = "free_y") +
+  scale_color_manual(values = c(
+    "KGML-Bulk" = puor$orange,
+    "KGML-FTICR" = puor$purple
+  )) +
+  labs(x = NULL, y = NULL, color = NULL) +
+  theme_review() +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+ggsave(figure_file("kgml_npoc_transform_ablation.pdf"),
+       p_npoc_transform_ablation, width = 8.5, height = 5.2)
+ggsave(figure_file("kgml_npoc_term_sensitivity.pdf"),
+       p_npoc_transform_ablation, width = 8.5, height = 5.2)
+
+npoc_transform_ablation_stats
+```
+
+
+## 9. GAM-NPOC Comparison
+
+This chunk fits a simple GAM residual model using `log_npoc`.
+It is used mainly for the supplement figure comparing RF and GAM correction shapes for the NPOC-only discrepancy.
+
+```{r gam-comparison}
+cv_gam <- fit_gam_cv(kgml_base, folds_grouped)
+cv_gam_loso <- fit_gam_cv(kgml_base, folds_loso)
+```
+
+## 10. Fixed-`Vh0` Sensitivity for NPOC-Only KGML
+
+This sensitivity reruns NPOC-only residual learning across several prescribed fixed `Vh0` values.
+It helps separate the effect of the chosen universal accessibility baseline from the learned residual correction.
+
+```{r npoc-vh0-sensitivity}
+vh0_sensitivity_values <- c(
+  fixed_0.05 = 0.05,
+  fixed_0.10 = 0.10,
+  fixed_0.25 = 0.25,
+  fixed_0.50 = 0.50,
+  fixed_1.00 = 1.00
+)
+
+make_kgml_base_for_vh0 <- function(vh0) {
+  mech %>%
+    mutate(
+      Vh0_fixed = vh0,
+      thermo_accessibility = abs(stoichMet_donor_mean) / (Vh0_fixed * npoc),
+      R_mech_fixed_vh0 = exp(-thermo_accessibility) * biomass_log10,
+      logR_mech_fixed_vh0 = safe_log10(R_mech_fixed_vh0),
+      dR_fixed_vh0 = logR_obs - logR_mech_fixed_vh0
+    ) %>%
+    transmute(
+      site, Position,
+      respC, npoc, inv_npoc, log_npoc = log10(npoc),
+      biomass = biomass_log10,
+      delGcat = delGcat_mean,
+      lambda = lambda_mean,
+      ne = ne_mean,
+      stoichMet_donor = stoichMet_donor_mean,
+      clay, silt, fine, med, coarse, ssa_tot, d50_mm,
+      Vh0_fixed, thermo_accessibility,
+      logR_obs,
+      logR_mech = logR_mech_fixed_vh0,
+      dR = dR_fixed_vh0
+    ) %>%
+    filter(if_all(c(respC, npoc, inv_npoc, log_npoc, logR_obs, logR_mech, dR),
+                  is.finite))
+}
+
+fit_gam_npoc_original_cv <- function(dat, folds) {
+  results <- vector("list", nrow(folds))
+
+  for (i in seq_len(nrow(folds))) {
+    train_data <- analysis(folds$splits[[i]])
+    test_data <- assessment(folds$splits[[i]])
+
+    gam_fit <- gam(
+      dR ~ s(npoc, k = 5) + s(inv_npoc, k = 5) + s(log_npoc, k = 5),
+      data = train_data,
+      method = "REML"
+    )
+
+    dR_hat <- predict(gam_fit, newdata = test_data)
+
+    results[[i]] <- test_data %>%
+      mutate(
+        fold_id = fold_id(folds, i),
+        model = "KGML GAM NPOC original",
+        dR_hat = dR_hat,
+        logR_pred = logR_mech + dR_hat
+      )
+  }
+
+  bind_rows(results)
+}
+
+npoc_vh0_sensitivity_predictions <- purrr::imap_dfr(
+  vh0_sensitivity_values,
+  function(vh0, vh0_label) {
+    dat <- make_kgml_base_for_vh0(vh0)
+    grouped <- make_group_folds(dat)
+    loso <- make_loso_folds(dat)
+
+    bind_rows(
+      fit_rf_cv(dat, npoc_predictors, "KGML-NPOC RF",
+                grouped)$predictions %>%
+        mutate(Validation = "Site-grouped 5-fold CV"),
+      fit_gam_npoc_original_cv(dat, grouped) %>%
+        mutate(Validation = "Site-grouped 5-fold CV"),
+      fit_rf_cv(dat, npoc_predictors, "KGML-NPOC RF",
+                loso)$predictions %>%
+        mutate(Validation = "Leave-one-site-out CV"),
+      fit_gam_npoc_original_cv(dat, loso) %>%
+        mutate(Validation = "Leave-one-site-out CV")
+    ) %>%
+      mutate(
+        Vh0_label = vh0_label,
+        Vh0 = vh0,
+        dR_hat = as.numeric(dR_hat),
+        logR_pred = as.numeric(logR_pred)
+      ) %>%
+      select(Validation, Vh0_label, Vh0, model, fold_id, site, Position,
+             respC, npoc, inv_npoc, log_npoc, logR_obs, logR_mech,
+             dR, dR_hat, logR_pred)
+  }
+)
+
+npoc_vh0_sensitivity_stats <- npoc_vh0_sensitivity_predictions %>%
+  group_by(Validation, Vh0_label, Vh0, model) %>%
+  group_modify(~ model_stats(.x$logR_obs, .x$logR_pred)) %>%
+  ungroup() %>%
+  rename(Model = model) %>%
+  select(Validation, Vh0_label, Vh0, Model, n, RMSE, Pearson_r, CCC, Bias, R2)
+
+write_csv(npoc_vh0_sensitivity_predictions,
+          derived_file("kgml_npoc_vh0_sensitivity_predictions.csv"))
+write_csv(npoc_vh0_sensitivity_stats,
+          derived_file("kgml_npoc_vh0_sensitivity_stats.csv"))
+
+p_npoc_vh0_sensitivity <- npoc_vh0_sensitivity_stats %>%
+  select(Validation, Vh0_label, Vh0, Model, RMSE, Pearson_r, CCC) %>%
+  pivot_longer(c(RMSE, Pearson_r, CCC),
+               names_to = "Metric", values_to = "Value") %>%
+  mutate(
+    Metric = recode(Metric, Pearson_r = "Pearson r"),
+    Metric = factor(Metric, levels = c("RMSE", "Pearson r", "CCC")),
+    Vh0_label = factor(Vh0_label, levels = names(vh0_sensitivity_values))
+  ) %>%
+  ggplot(aes(x = Vh0_label, y = Value, color = Model, group = Model)) +
+  geom_line(linewidth = 0.65) +
+  geom_point(size = 2) +
+  facet_grid(Validation ~ Metric, scales = "free_y") +
+  scale_color_manual(values = c(
+    "KGML-NPOC RF" = puor$orange,
+    "KGML GAM NPOC original" = puor$purple
+  )) +
+  labs(x = expression(fixed~V[h][0]), y = NULL, color = NULL) +
+  theme_review() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(figure_file("kgml_npoc_vh0_sensitivity.pdf"),
+       p_npoc_vh0_sensitivity, width = 8.5, height = 5.2)
+
+npoc_vh0_sensitivity_stats
+```
+
+## 11. Combined Prediction and Statistics Tables
+
+This chunk standardizes the prediction outputs from all main KGML and pure data-driven models.
+It writes the core CSV files used by the Section 3.3 performance figures:
+`kgml_cv_predictions_all.csv`, `kgml_cv_stats_all.csv`, and `kgml_cv_stats_compact.csv`.
+
+```{r combined-kgml-stats}
+standardize_predictions <- function(dat, validation, model_label) {
+  dat %>%
+    mutate(
+      Validation = validation,
+      Vh0 = fixed_vh0_kgml,
+      Model = model_label
+    ) %>%
+    select(Validation, Vh0, Model, fold_id, site, Position, respC, npoc, inv_npoc,
+           log_npoc, logR_obs, logR_mech, dR, dR_hat, logR_pred) %>%
+    mutate(across(c(respC, npoc, inv_npoc, log_npoc, logR_obs, logR_mech,
+                    dR, dR_hat, logR_pred), as.numeric))
+}
+
+kgml_cv_predictions_all <- bind_rows(
+  standardize_predictions(cv_npoc, "Site-grouped 5-fold CV", "KGML-NPOC"),
+  standardize_predictions(pure_rf_npoc$predictions, "Site-grouped 5-fold CV", "Pure RF-NPOC"),
+  standardize_predictions(pure_xgb_npoc, "Site-grouped 5-fold CV", "Pure XGBoost-NPOC"),
+  standardize_predictions(cv_expanded, "Site-grouped 5-fold CV", "KGML-Bulk"),
+  if (exists("cv_ft")) standardize_predictions(cv_ft, "Site-grouped 5-fold CV", "KGML-FTICR"),
+  standardize_predictions(cv_gam, "Site-grouped 5-fold CV", "KGML-GAM NPOC"),
+  standardize_predictions(pure_rf$predictions, "Site-grouped 5-fold CV", "Pure RF-Bulk"),
+  standardize_predictions(pure_xgb, "Site-grouped 5-fold CV", "Pure XGBoost-Bulk"),
+  if (exists("pure_rf_fticr")) standardize_predictions(pure_rf_fticr, "Site-grouped 5-fold CV", "Pure RF-FTICR"),
+  if (exists("pure_xgb_fticr")) standardize_predictions(pure_xgb_fticr, "Site-grouped 5-fold CV", "Pure XGBoost-FTICR"),
+  standardize_predictions(cv_npoc_loso, "Leave-one-site-out CV", "KGML-NPOC"),
+  standardize_predictions(pure_rf_npoc_loso$predictions, "Leave-one-site-out CV", "Pure RF-NPOC"),
+  standardize_predictions(pure_xgb_npoc_loso, "Leave-one-site-out CV", "Pure XGBoost-NPOC"),
+  standardize_predictions(cv_expanded_loso, "Leave-one-site-out CV", "KGML-Bulk"),
+  if (exists("cv_ft_loso")) standardize_predictions(cv_ft_loso, "Leave-one-site-out CV", "KGML-FTICR"),
+  standardize_predictions(cv_gam_loso, "Leave-one-site-out CV", "KGML-GAM NPOC"),
+  standardize_predictions(pure_rf_loso$predictions, "Leave-one-site-out CV", "Pure RF-Bulk"),
+  standardize_predictions(pure_xgb_loso, "Leave-one-site-out CV", "Pure XGBoost-Bulk"),
+  if (exists("pure_rf_fticr_loso")) standardize_predictions(pure_rf_fticr_loso, "Leave-one-site-out CV", "Pure RF-FTICR"),
+  if (exists("pure_xgb_fticr_loso")) standardize_predictions(pure_xgb_fticr_loso, "Leave-one-site-out CV", "Pure XGBoost-FTICR")
+)
+
+mechanistic_predictions_all <- bind_rows(
+  cv_npoc %>%
+    mutate(Validation = "Site-grouped 5-fold CV", Vh0 = fixed_vh0_kgml,
+           Model = "Mechanistic fixed Vh0", logR_pred = logR_mech,
+           dR_hat = 0) %>%
+    select(Validation, Vh0, Model, fold_id, site, Position, respC, npoc,
+           inv_npoc, log_npoc, logR_obs, logR_mech, dR, dR_hat, logR_pred),
+  cv_npoc_loso %>%
+    mutate(Validation = "Leave-one-site-out CV", Vh0 = fixed_vh0_kgml,
+           Model = "Mechanistic fixed Vh0", logR_pred = logR_mech,
+           dR_hat = 0) %>%
+    select(Validation, Vh0, Model, fold_id, site, Position, respC, npoc,
+           inv_npoc, log_npoc, logR_obs, logR_mech, dR, dR_hat, logR_pred)
+)
+
+kgml_cv_predictions_all <- bind_rows(
+  mechanistic_predictions_all,
+  kgml_cv_predictions_all
+)
+
+kgml_cv_stats_all <- kgml_cv_predictions_all %>%
+  group_by(Validation, Vh0, Model) %>%
+  group_modify(~ model_stats(.x$logR_obs, .x$logR_pred)) %>%
+  ungroup() %>%
+  select(Validation, Vh0, Model, everything()) %>%
+  arrange(
+    factor(Validation, levels = c("Site-grouped 5-fold CV", "Leave-one-site-out CV")),
+    RMSE
+  )
+
+write_csv(kgml_cv_predictions_all,
+          derived_file("kgml_cv_predictions_all.csv"))
+write_csv(kgml_cv_stats_all,
+          derived_file("kgml_cv_stats_all.csv"))
+
+kgml_cv_stats_compact <- kgml_cv_stats_all %>%
+  select(Validation, Vh0, Model, n, RMSE, Pearson_r, CCC, Bias)
+
+write_csv(kgml_cv_stats_compact,
+          derived_file("kgml_cv_stats_compact.csv"))
+
+kgml_cv_stats_all
+```
+
+
+##############################################################################################################
+## 12. Figure: KGML Residual Structure
+
+This chunk creates the main residual-structure plots for KGML-NPOC, KGML-Bulk, and KGML-FTICR.
+Each plot contrasts the original mechanistic residual with the KGML residual along `1/NPOC`.
+```{r combined-figures}
+plot_inputs <- list(
+  cv_npoc %>% select(site, Position, logR_obs, logR_mech, logR_pred, npoc, model),
+  cv_expanded %>% select(site, Position, logR_obs, logR_mech, logR_pred, npoc, model),
+  cv_gam %>% select(site, Position, logR_obs, logR_mech, logR_pred, npoc, model)
+)
+
+if (exists("cv_ft")) {
+  plot_inputs <- c(
+    plot_inputs,
+    list(cv_ft %>% select(site, Position, logR_obs, logR_mech,
+                          logR_pred, npoc, model))
+  )
+}
+
+plot_data <- bind_rows(plot_inputs) %>%
+  group_by(model, site, Position) %>%
+  summarise(
+    logR_obs = mean(logR_obs, na.rm = TRUE),
+    logR_mech = mean(logR_mech, na.rm = TRUE),
+    logR_pred = mean(logR_pred, na.rm = TRUE),
+    npoc = mean(npoc, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+lims <- range(c(plot_data$logR_obs, plot_data$logR_mech, plot_data$logR_pred),
+              na.rm = TRUE)
+
+p_fit <- ggplot(plot_data, aes(x = logR_obs, y = logR_pred, color = model)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  coord_equal(xlim = lims, ylim = lims) +
+  labs(x = "Observed log10(R)", y = "KGML predicted log10(R)", color = "Model") +
+  theme_review()
+
+p_fit
+
+resid_data <- plot_data %>%
+  mutate(
+    inv_npoc = 1 / npoc,
+    resid_mech = logR_obs - logR_mech,
+    resid_kgml = logR_obs - logR_pred
+  ) %>%
+  pivot_longer(c(resid_mech, resid_kgml),
+               names_to = "series", values_to = "residual") %>%
+  mutate(
+    model = recode(
+      model,
+      "KGML RF NPOC" = "KGML-NPOC",
+      "KGML RF expanded" = "KGML-Bulk",
+      "KGML RF FTICR" = "KGML-FTICR",
+      "KGML GAM NPOC" = "KGML-GAM NPOC"
+    ),
+    series = recode(
+      series,
+      resid_mech = "Mechanistic",
+      resid_kgml = "KGML"
+    )
+  )
+
+write_csv(resid_data, derived_file("kgml_residual_structure_plot_data.csv"))
+
+make_residual_plot <- function(dat, model_label) {
+  dat %>%
+    filter(model == model_label) %>%
+    ggplot(aes(x = inv_npoc, y = residual, color = series)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_point(alpha = 0.55) +
+    ylim(-2.2, 4) +
+    geom_smooth(method = "loess", se = FALSE) +
+    scale_color_manual(values = c(
+      "Mechanistic" = puor$purple,
+      "KGML" = puor$orange
+    )) +
+    labs(x = "1/NPOC", y = "Residual log10(R)", color = NULL) +
+    theme_review()
+}
+
+p_resid_npoc <- make_residual_plot(resid_data, "KGML-NPOC")
+p_resid_bulk <- make_residual_plot(resid_data, "KGML-Bulk")
+p_resid_fticr <- make_residual_plot(resid_data, "KGML-FTICR")
+
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  p_resid <- p_resid_npoc | p_resid_bulk | p_resid_fticr
+    p_resid <- p_resid +
+    patchwork::plot_layout(guides = "collect") &
+    theme(legend.position = "right")
+  ggsave(figure_file("kgml_residual_structure_main.pdf"), p_resid,
+         width = 10, height = 3)
+} else {
+  p_resid <- p_resid_npoc
+}
+
+```
+
+## 13. Supplement Inputs: RF vs GAM NPOC Correction Function
+
+This chunk builds the NPOC correction-function objects used in the four-panel supplement figure below.
+It compares the NPOC-only RF residual correction with a GAM correction.
+It tests whether the learned residual correction along `log10(NPOC)` is a smooth, systematic pattern rather than an arbitrary RF artifact.
+The second subplot shows how the GAM correction changes residual structure against `1/NPOC`.
+
+```{r rf-gam-npoc-correction-figure}
+npoc_correction_points <- kgml_base %>%
+  distinct(site, Position, log_npoc, dR)
+
+npoc_correction_lines <- bind_rows(
+  cv_npoc %>%
+    transmute(site, Position, log_npoc, Model = "RF", dR_hat),
+  cv_gam %>%
+    transmute(site, Position, log_npoc, Model = "GAM", dR_hat)) %>%
+  group_by(Model, site, Position) %>%
+  summarise(
+    log_npoc = mean(log_npoc, na.rm = TRUE),
+    dR_hat = mean(dR_hat, na.rm = TRUE),
+    .groups = "drop") %>%
+  arrange(Model, log_npoc)
+
+write_csv(npoc_correction_lines,
+          derived_file("kgml_rf_gam_npoc_correction_function.csv"))
+
+p_npoc_correction <- ggplot() +
+  geom_point(
+    data = npoc_correction_points,
+    aes(x = log_npoc, y = dR),
+    color = "grey65", alpha = 0.65, size = 1.6) +
+  geom_line(
+    data = npoc_correction_lines,
+    aes(x = log_npoc, y = dR_hat, color = Model),
+    linewidth = 0.9, alpha=0.75) +
+  scale_color_manual(values = c(GAM = puor$dark_purple, RF = puor$dark_orange)) +
+  labs(x = expression(log[10](NPOC)),
+       y = "Residual correction (dR)",
+       color = "Model") +
+  theme_review()
+
+gam_residual_data <- cv_gam %>%
+  group_by(site, Position) %>%
+  summarise(
+    logR_obs = mean(logR_obs, na.rm = TRUE),
+    logR_mech = mean(logR_mech, na.rm = TRUE),
+    logR_pred = mean(logR_pred, na.rm = TRUE),
+    npoc = mean(npoc, na.rm = TRUE),
+    .groups = "drop") %>%
+  mutate(
+    inv_npoc = 1 / npoc,
+    `Mechanistic residual` = logR_obs - logR_mech,
+    `GAM residual` = logR_obs - logR_pred) %>%
+  pivot_longer(
+    c(`Mechanistic residual`, `GAM residual`),
+    names_to = "Series",
+    values_to = "Residual")
+
+write_csv(gam_residual_data,
+          derived_file("kgml_gam_npoc_residual_plot_data.csv"))
+
+p_gam_residual <- ggplot(gam_residual_data,
+                         aes(x = inv_npoc, y = Residual, color = Series)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_point(alpha = 0.55, size = 1.6) +
+  ylim(-2.2, 4) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 0.8) +
+  scale_color_manual(values = c(
+    "Mechanistic residual" = puor$purple,
+    "GAM residual" = puor$orange)) +
+  labs(x = "1/NPOC", y = "Residual log10(R)", color = NULL) +
+  theme_review()
+
+
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  p_rf_gam_supplement <- p_gam_residual|p_npoc_correction
+  ggsave(figure_file("kgml_rf_gam_npoc_supplement.pdf"),
+         p_rf_gam_supplement, width = 5.8, height = 3.3)
+}
+
+p_npoc_correction
+```
+
+## 14. Supplement Figure: Bulk+FTICR Residual Correction
+
+This supplement figure mirrors the RF-vs-GAM NPOC diagnostic above, but for the Bulk+FTICR sensitivity model.
+The left panel shows whether KGML-Bulk+FTICR reduces the mechanistic residual structure along `1/NPOC`.
+The right panel shows the projected RF and GAM residual-correction functions along `log10(NPOC)`.
+
+```{r kgml-residual-correction-supplement}
+bulk_fticr_predictions <- read_csv(
+  derived_file("kgml_bulk_fticr_sensitivity_predictions.csv"),
+  col_types = cols(site = col_character())
+)
+
+bulk_fticr_correction_smooth <- read_csv(
+  derived_file("kgml_bulk_fticr_rf_gam_correction_function.csv"),
+  col_types = cols()
+)
+
+bulk_fticr_residual_data <- bulk_fticr_predictions %>%
+  filter(Validation == "Site-grouped 5-fold CV",
+         model == "KGML-Bulk+FTICR") %>%
+  group_by(site, Position) %>%
+  summarise(
+    logR_obs = mean(logR_obs, na.rm = TRUE),
+    logR_mech = mean(logR_mech, na.rm = TRUE),
+    logR_pred = mean(logR_pred, na.rm = TRUE),
+    npoc = mean(npoc, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    inv_npoc = 1 / npoc,
+    Mechanistic = logR_obs - logR_mech,
+    `KGML-Bulk+FTICR` = logR_obs - logR_pred
+  ) %>%
+  pivot_longer(
+    c(Mechanistic, `KGML-Bulk+FTICR`),
+    names_to = "Series",
+    values_to = "Residual"
+  )
+
+bulk_fticr_correction_points <- bulk_fticr_predictions %>%
+  filter(Validation == "Site-grouped 5-fold CV",
+         model == "KGML-Bulk+FTICR") %>%
+  distinct(site, Position, log_npoc, dR)
+
+write_csv(bulk_fticr_residual_data,
+          derived_file("kgml_bulk_fticr_residual_plot_data.csv"))
+
+p_supp_bulk_fticr_residual <- ggplot(
+  bulk_fticr_residual_data,
+  aes(x = inv_npoc, y = Residual, color = Series)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_point(alpha = 0.55, size = 1.4) +
+  ylim(-2.2, 4) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 0.8) +
+  scale_color_manual(values = c(
+    "Mechanistic" = puor$purple,
+    "KGML-Bulk+FTICR" = puor$orange
+  )) +
+  labs(x = "1/NPOC", y = "Residual log10(R)", color = NULL) +
+  theme_review()
+
+p_supp_bulk_fticr_decay <- ggplot() +
+  geom_point(
+    data = bulk_fticr_correction_points,
+    aes(x = log_npoc, y = dR),
+    color = "grey65", alpha = 0.55, size = 1.4
+  ) +
+  geom_line(
+    data = bulk_fticr_correction_smooth,
+    aes(x = log_npoc, y = dR_hat, color = Model),
+    linewidth = 0.9, alpha = 0.75
+  ) +
+  scale_color_manual(values = c(GAM = puor$dark_purple, RF = puor$dark_orange)) +
+  labs(x = expression(log[10](NPOC)),
+       y = "Residual correction (dR)",
+       color = "Model") +
+  theme_review()
+
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  p_residual_correction_supplement <- p_supp_bulk_fticr_residual|p_supp_bulk_fticr_decay
+
+  ggsave(figure_file("kgml_residual_correction_supplement.pdf"),
+         p_residual_correction_supplement, width = 5.8, height = 3.3)
+} else {
+  p_residual_correction_supplement <- p_supp_bulk_fticr_residual
+}
+
+p_residual_correction_supplement
+```
+
+## 16. Figure: Pure Data-Driven Prediction and Residual Structure
+
+This figure compares KGML-Bulk/FTICR against pure RF/XGBoost models using the site-grouped 5-fold predictions.
+The first panel set shows observed-vs-predicted agreement; the second shows residual structure along `1/NPOC`.
+Use this figure to support the Section 3.3 comparison between mechanistically constrained KGML and flexible pure data-driven prediction.
+
+```{r pure-data-driven-prediction-figure}
+pure_kgml_models <- c(
+  "KGML-NPOC",
+  "Pure RF-NPOC",
+  "Pure XGBoost-NPOC",
+  "KGML-Bulk",
+  "Pure RF-Bulk",
+  "Pure XGBoost-Bulk",
+  "KGML-FTICR",
+  "Pure RF-FTICR",
+  "Pure XGBoost-FTICR"
+)
+
+pure_prediction_plot_data <- kgml_cv_predictions_all %>%
+  filter(
+    Validation == "Site-grouped 5-fold CV",
+    Model %in% pure_kgml_models
+  ) %>%
+  group_by(Model, site, Position) %>%
+  summarise(
+    logR_obs = mean(logR_obs, na.rm = TRUE),
+    logR_mech = mean(logR_mech, na.rm = TRUE),
+    logR_pred = mean(logR_pred, na.rm = TRUE),
+    inv_npoc = mean(inv_npoc, na.rm = TRUE),
+    mechanistic_residual = mean(logR_obs - logR_mech, na.rm = TRUE),
+    model_residual = mean(logR_obs - logR_pred, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Model = factor(Model, levels = pure_kgml_models),
+    Model_class = case_when(
+      str_detect(as.character(Model), "^KGML") ~ "KGML",
+      TRUE ~ "Pure data-driven"
+    ),
+    Predictor_set = case_when(
+      str_detect(as.character(Model), "NPOC") ~ "NPOC",
+      str_detect(as.character(Model), "Bulk") ~ "Bulk",
+      str_detect(as.character(Model), "FTICR") ~ "FTICR",
+      TRUE ~ NA_character_
+    ),
+    Model_type = case_when(
+      str_detect(as.character(Model), "^KGML") ~ "KGML",
+      str_detect(as.character(Model), "RF") ~ "Pure RF",
+      str_detect(as.character(Model), "XGBoost") ~ "Pure XGBoost",
+      TRUE ~ as.character(Model)
+    )
+  )
+
+pure_prediction_plot_data <- pure_prediction_plot_data %>%
+  mutate(Predictor_set = factor(Predictor_set, levels = c("NPOC", "Bulk", "FTICR")))
+
+pure_residual_plot_data <- pure_prediction_plot_data %>%
+  pivot_longer(
+    c(mechanistic_residual, model_residual),
+    names_to = "Series",
+    values_to = "Residual"
+  ) %>%
+  mutate(
+    Series = recode(
+      Series,
+      mechanistic_residual = "Mechanistic",
+      model_residual = "Model"
+    )
+  )
+
+write_csv(pure_prediction_plot_data,
+          derived_file("kgml_pure_data_prediction_plot_data.csv"))
+write_csv(pure_residual_plot_data,
+          derived_file("kgml_pure_data_residual_plot_data.csv"))
+
+pure_model_colors <- c(
+  "KGML" = puor$purple,
+  "Pure RF" = puor$orange,
+  "Pure XGBoost" = puor$dark_orange
+)
+
+lims_pure <- range(c(pure_prediction_plot_data$logR_obs,
+                     pure_prediction_plot_data$logR_pred),
+                   na.rm = TRUE)
+
+p_pure_prediction <- ggplot(
+  pure_prediction_plot_data,
+  aes(x = logR_obs, y = logR_pred, color = Model_type)
+) +
+  geom_point(alpha = 0.62, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  coord_equal(xlim = lims_pure, ylim = lims_pure) +
+  facet_wrap(~ Predictor_set, nrow = 1) +
+  scale_color_manual(values = pure_model_colors) +
+  labs(x = "Observed log10(R)", y = "Predicted log10(R)",
+       color = NULL) +
+  theme_review() +
+  theme(legend.position = "top")
+
+p_pure_residual <- ggplot(
+  pure_residual_plot_data,
+  aes(x = inv_npoc, y = Residual, color = Series)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_point(alpha = 0.55, size = 1.4) +
+  ylim(-2.2, 4) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 0.8) +
+  facet_wrap(~ Model, nrow = 2) +
+  scale_color_manual(values = c(
+    "Mechanistic" = puor$purple,
+    "Model" = puor$orange
+  )) +
+  labs(x = "1/NPOC", y = "Residual log10(R)") +
+  theme_review() +
+  theme(legend.position = "none")
+
+ggsave(figure_file("kgml_pure_data_prediction_1to1.pdf"),
+       p_pure_prediction, width = 7.2, height = 3.6)
+ggsave(figure_file("kgml_pure_data_residual_structure.pdf"),
+       p_pure_residual, width = 8.6, height = 5.6)
+
+p_pure_prediction
+p_pure_residual
+```
+
+## 17. Figure: Model Performance Lollipop by Validation Scheme
+
+These figures compare model performance across RMSE, Pearson r, and CCC.
+KGML and pure tree-based data-driven models are shown together.
+Site-grouped 5-fold and leave-one-site-out results are saved as separate figures rather than faceted by validation scheme.
+
+```{r combined-stats-lollipop}
+metric_labels <- c(
+  RMSE = "RMSE",
+  Pearson_r = "Pearson r",
+  CCC = "CCC"
+)
+
+lollipop_data <- kgml_cv_stats_all %>%
+  filter(Model != "KGML-GAM NPOC") %>%
+  select(Validation, Model, RMSE, Pearson_r, CCC) %>%
+  pivot_longer(c(RMSE, Pearson_r, CCC),
+               names_to = "Metric", values_to = "Value") %>%
+  mutate(
+    Metric = factor(metric_labels[Metric],
+                    levels = c("RMSE", "Pearson r", "CCC")),
+    Model = factor(Model, levels = rev(c(
+      "Mechanistic fixed Vh0",
+      "KGML-NPOC",
+      "Pure RF-NPOC",
+      "Pure XGBoost-NPOC",
+      "KGML-Bulk",
+      "Pure RF-Bulk",
+      "Pure XGBoost-Bulk",
+      "KGML-FTICR",
+      "Pure RF-FTICR",
+      "Pure XGBoost-FTICR"
+    )))
+  )
+
+write_csv(lollipop_data,
+          derived_file("kgml_model_comparison_lollipop_data.csv"))
+
+make_validation_lollipop <- function(dat, validation_label) {
+  dat %>%
+    filter(Validation == validation_label) %>%
+    ggplot(aes(x = Value, y = Model, color = Model)) +
+    geom_segment(aes(x = 0, xend = Value, yend = Model),
+                 linewidth = 1, alpha = 0.85) +
+    geom_point(size = 2.3) +
+    facet_wrap(~ Metric, scales = "free_x", nrow = 1) +
+    scale_color_puor(levels(lollipop_data$Model)) +
+    labs(x = NULL, y = NULL) +
+    theme_review() +
+    theme(
+      legend.position = "none",
+      panel.grid.major.y = element_blank(),
+      strip.text = element_text(face = "bold")
+    )
+}
+
+p_stats_lollipop_grouped <- make_validation_lollipop(
+  lollipop_data, "Site-grouped 5-fold CV"
+)
+p_stats_lollipop_loso <- make_validation_lollipop(
+  lollipop_data, "Leave-one-site-out CV"
+)
+
+ggsave(figure_file("kgml_tree_model_comparison_grouped5fold.pdf"),
+       p_stats_lollipop_grouped, width = 8, height = 3.6)
+ggsave(figure_file("kgml_tree_model_comparison_loso.pdf"),
+       p_stats_lollipop_loso, width = 8, height = 3.6)
+
+p_stats_lollipop_grouped
+p_stats_lollipop_loso
+```

@@ -1,0 +1,581 @@
+---
+title: "01 Process S19S Sediment Data"
+author: "Jianqiu Zheng"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+source("R/helpers.R")
+dir.create(derived_file("position_peak_files"), showWarnings = FALSE, recursive = TRUE)
+```
+
+## Purpose
+
+This notebook recreates the sediment modeling inputs from the raw WHONDRS S19S files. It preserves the original data-processing logic from the first section of `S19S_sed_model_graph.Rmd`, but writes all reproducible intermediates to `derived/` instead of the project root.
+
+The main outputs are:
+
+- `derived/S19S_sed_with_metadata.csv`: FTICR sediment peak lookup table with sample metadata.
+- `derived/S19S_sed_therm_meta.csv`: FTICR lookup table matched to the thermodynamic-model output.
+- `derived/up_all.csv`, `derived/mid_all.csv`, `derived/low_all.csv`: peak-level modeling inputs for upstream, midstream, and downstream sediment samples.
+- `derived/s19s_sed_analysis_table.csv`: site-position summary table used by the mechanistic and KGML notebooks.
+
+## Raw and Upstream Inputs
+
+The required observational source files are kept in `raw_data/`:
+
+- `v4_WHONDRS_S19S_Metadata.csv`
+- `Processed_Clean_S19S_Water_Field_sediments_9-29_Data.csv`
+- `Processed_Clean_S19S_Water_Field_sediments_9-29_Mol.csv`
+- `WHONDRS_S19S_Sediment_Water_Mass_Volume.csv`
+- `WHONDRS_S19S_Sediment_Incubations_respiration_Rates_v6.csv`
+- `WHONDRS_S19S_Sediment_NPOC.csv`
+- `WHONDRS_S19S_Sediment_FlowCytometry.csv`
+- `WHONDRS_S19S_Sediment_GrainSize.csv`
+
+`S19S_sed_oxy.csv` is not a raw observational file. It is the precomputed output of the thermodynamic modeling workflow in `../Thermodynamic_modeling.Rmd` (also mirrored in `../FTICRMS_processed/Thermodynamic_modeling.Rmd`). This notebook starts from that thermodynamic output and joins it to the FTICR sediment lookup table by the original row order.
+
+```{r metadata-map}
+geodata <- read_csv(raw_file("v4_WHONDRS_S19S_Metadata.csv"), show_col_types = FALSE)
+
+geosub <- geodata %>%
+  filter(Country == "USA") %>%
+  transmute(
+    ID = unify_site_id(Sample_ID),
+    Stream_order = na_if(Stream_Order, "Not_Provided"),
+    Latitude = suppressWarnings(as.numeric(na_if(MS_Latitude_dec.deg, "Not_Provided"))),
+    Longitude = suppressWarnings(as.numeric(na_if(MS_Longitude_dec.deg, "Not_Provided")))
+  ) %>%
+  filter(!is.na(Latitude), !is.na(Longitude))
+
+write_csv(geosub, derived_file("s19s_usa_site_coordinates.csv"))
+
+if (requireNamespace("sf", quietly = TRUE) &&
+    requireNamespace("rnaturalearth", quietly = TRUE) &&
+    requireNamespace("patchwork", quietly = TRUE)) {
+  library(sf)
+  library(rnaturalearth)
+  library(patchwork)
+
+  pts_sf <- st_as_sf(geosub, coords = c("Longitude", "Latitude"), crs = 4326)
+  us_states <- ne_states(country = "United States of America", returnclass = "sf")
+  conus <- us_states[!us_states$name %in% c(
+    "Alaska", "Hawaii", "Puerto Rico", "Guam",
+    "Northern Mariana Islands", "American Samoa"
+  ), ]
+  alaska <- us_states[us_states$name == "Alaska", ]
+
+  conus_union <- st_union(conus)
+  alaska_union <- st_union(alaska)
+  pts_conus <- pts_sf[st_within(pts_sf, conus_union, sparse = FALSE)[, 1], ]
+  pts_ak <- pts_sf[st_within(pts_sf, alaska_union, sparse = FALSE)[, 1], ]
+
+  p_conus <- ggplot() +
+    geom_sf(data = conus, fill = "grey95", colour = "grey60", linewidth = 0.15) +
+    geom_sf(data = pts_conus, aes(fill = Stream_order),
+            shape = 21, size = 3, colour = "black") +
+    coord_sf(expand = FALSE) +
+    scale_fill_brewer(palette = "Set3") +
+    labs(fill = "Stream order") +
+    theme_minimal(base_size = 11, base_family = "Helvetica") %+replace%
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "white", colour = NA),
+      plot.background = element_rect(fill = "white", colour = NA),
+      legend.position = "top"
+    )
+
+  p_ak <- ggplot() +
+    geom_sf(data = alaska, fill = "grey95", colour = "grey60", linewidth = 0.15) +
+    geom_sf(data = pts_ak, aes(fill = Stream_order),
+            shape = 21, size = 3, stroke = 0.4, colour = "black") +
+    coord_sf(xlim = c(-170, -130), ylim = c(50, 72), expand = FALSE, datum = NA) +
+    scale_fill_brewer(palette = "Set3", guide = "none") +
+    theme_void()
+
+  p_site_map <- p_conus +
+    inset_element(p_ak, left = 0.02, bottom = 0.73, right = 0.27,
+                  top = 0.98, clip = TRUE, align_to = "full")
+} else {
+  p_site_map <- ggplot(geosub, aes(x = Longitude, y = Latitude, fill = Stream_order)) +
+    geom_point(shape = 21, size = 3, color = "black") +
+    coord_quickmap() +
+    scale_fill_brewer(palette = "Set3") +
+    labs(x = "Longitude", y = "Latitude", fill = "Stream order") +
+    theme_minimal(base_size = 11, base_family = "Helvetica") %+replace%
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "white", colour = NA),
+      plot.background = element_rect(fill = "white", colour = NA),
+      legend.position = "top"
+    )
+}
+
+ggsave(figure_file("process_site_map_all.pdf"), p_site_map, width = 5.5, height = 5.5)
+p_site_map
+```
+
+```{r fticr-lookup-table}
+# This section intentionally uses base read.csv(), matching the original
+# workflow. For this wide FTICR table, readr parsing changes the nonzero
+# lookup and no longer row-matches the thermodynamic output.
+presence <- read.csv(raw_file("Processed_Clean_S19S_Water_Field_sediments_9-29_Data.csv"))
+mol <- read.csv(raw_file("Processed_Clean_S19S_Water_Field_sediments_9-29_Mol.csv"))
+
+names(presence)[1] <- "Mass"
+presence <- mutate(presence, row_id = row_number())
+mol <- mutate(mol, row_id = row_number())
+
+mol_subset <- mol %>%
+  select(row_id, Mass, MolForm)
+
+fticr_lookup <- merge(presence, mol_subset, by = "row_id") %>%
+  select(-one_of("row_id", "Mass.y")) %>%
+  select(Mass.x, MolForm, everything()) %>%
+  pivot_longer(
+    cols = -c(Mass.x, MolForm),
+    names_to = "Site_ID",
+    values_to = "Count"
+  ) %>%
+  filter(Count != 0) %>%
+  na.omit() %>%
+  mutate(
+    Type = if_else(str_detect(Site_ID, "Sed"), "Sediment", "Water"),
+    site = unify_site_id(Site_ID),
+    Position = str_extract(Site_ID, "(?<=ICR\\.)[UMD]|(?<=ICR-)[UMD]")
+  )
+
+sed_lookup <- fticr_lookup %>%
+  filter(Type == "Sediment")
+
+write_csv(sed_lookup, derived_file("S19S_sed_with_metadata.csv"))
+
+sed_lookup %>%
+  summarise(
+    rows = n(),
+    sites = n_distinct(site),
+    site_positions = n_distinct(paste(site, Position)),
+    formulas = n_distinct(MolForm)
+  )
+```
+
+```{r thermodynamic-row-match}
+ther <- read_csv(raw_file("S19S_sed_oxy.csv"), show_col_types = FALSE)
+
+ther_subset <- ther %>%
+  select(delGcat, lambda, ne, stoichMet_donor, stoichMet_acceptor,
+         stoichMet_hco3, C_num, CUE)
+
+if (nrow(ther_subset) != nrow(sed_lookup)) {
+  stop("Thermodynamic result rows do not match the sediment lookup rows.")
+}
+
+ther_meta <- bind_cols(
+  sed_lookup %>% select(ID = site, Position, MolForm),
+  ther_subset
+)
+
+write_csv(ther_meta, derived_file("S19S_sed_therm_meta.csv"))
+
+ther_meta %>%
+  count(Position, name = "peak_rows") %>%
+  arrange(Position)
+```
+
+```{r split-thermodynamic-by-position}
+ther_data <- read_csv(derived_file("S19S_sed_therm_meta.csv"),
+                      col_types = cols(ID = col_character()))
+
+up_data <- ther_data %>% filter(Position == "U") %>% select(-Position)
+mid_data <- ther_data %>% filter(Position == "M") %>% select(-Position)
+low_data <- ther_data %>% filter(Position == "D") %>% select(-Position)
+
+write_position_files <- function(dat, suffix) {
+  site_ids <- sort(unique(dat$ID))
+  walk2(site_ids, seq_along(site_ids), function(site_id, i) {
+    write_csv(
+      filter(dat, ID == site_id),
+      derived_file("position_peak_files", paste0(i, "_", suffix, ".csv"))
+    )
+  })
+  tibble(Position = suffix, sites = length(site_ids), peak_rows = nrow(dat))
+}
+
+position_file_summary <- bind_rows(
+  write_position_files(up_data, "up"),
+  write_position_files(mid_data, "mid"),
+  write_position_files(low_data, "low")
+)
+
+write_csv(position_file_summary, derived_file("position_peak_file_summary.csv"))
+position_file_summary
+```
+
+```{r miscellaneous-sediment-data}
+mass <- read_csv(raw_file("WHONDRS_S19S_Sediment_Water_Mass_Volume.csv"),
+                 show_col_types = FALSE) %>%
+  select(Sample_ID, Wet_Sediment_Mass_g, Water_Mass_g) %>%
+  mutate(across(c(Wet_Sediment_Mass_g, Water_Mass_g), ~ na_if(.x, -9999)))
+
+mean_wet_mass <- mean(mass$Wet_Sediment_Mass_g, na.rm = TRUE)
+mass <- mass %>%
+  mutate(across(c(Wet_Sediment_Mass_g, Water_Mass_g),
+                ~ replace_na(.x, mean_wet_mass))) %>%
+  rename(ID = Sample_ID, sed_mass = Wet_Sediment_Mass_g, water_mass = Water_Mass_g)
+
+rates <- read_csv(raw_file("WHONDRS_S19S_Sediment_Incubations_respiration_Rates_v6.csv"),
+                  show_col_types = FALSE) %>%
+  select(ID = Sample_ID, rate = rate_mg_per_L_per_h)
+
+npoc <- read_csv(raw_file("WHONDRS_S19S_Sediment_NPOC.csv"),
+                 show_col_types = FALSE) %>%
+  select(ID = Sample_ID, conc = `00681_NPOC_mg_per_L_as_C`) %>%
+  mutate(conc = na_if(as.character(conc), "Above_Range_Greater_Than_22"),
+         conc = as.numeric(conc))
+
+fc <- read_csv(raw_file("WHONDRS_S19S_Sediment_FlowCytometry.csv"),
+               show_col_types = FALSE) %>%
+  transmute(
+    ID = Sample_ID,
+    bac = Total_Bacteria_cells_per_gram,
+    photo = Total_Photorophs_cells_per_gram,
+    hetero = Total_Heterotrophs_cells_per_gram,
+    biomass = log10(hetero)
+  ) %>%
+  select(ID, biomass)
+
+raw_gs <- read_csv(raw_file("WHONDRS_S19S_Sediment_GrainSize.csv"),
+                   show_col_types = FALSE) %>%
+  transmute(
+    ID = Sample_ID,
+    fine = Percent_Fine_Sand,
+    med = Percent_Med_Sand,
+    coarse = Percent_Coarse_Sand,
+    clay = Percent_Clay,
+    silt = Percent_Silt
+  )
+
+write_csv(raw_gs, derived_file("grain_size_weight_fraction_inputs.csv"))
+
+grain_weight_long <- raw_gs %>%
+  slice_head(n = 30) %>%
+  pivot_longer(-ID, names_to = "variable", values_to = "value")
+
+p_grain_weight <- ggplot(grain_weight_long, aes(x = ID, y = value, fill = variable)) +
+  geom_col() +
+  scale_fill_manual(values = c("#8073ac", "#b2abd2", "#d8daeb", "#fdb863", "#b35806")) +
+  labs(x = NULL, y = "Weight fraction", fill = "Class") +
+  theme_review() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+raw_gs <- raw_gs %>%
+  mutate(
+    v_f = fine / 1.60,
+    v_m = med / 1.70,
+    v_c = coarse / 1.70,
+    v_clay = clay / 1.40,
+    v_silt = silt / 1.55,
+    v_sum = v_f + v_m + v_c + v_clay + v_silt,
+    v_fine = v_f / v_sum,
+    v_med = v_m / v_sum,
+    v_coarse = v_c / v_sum,
+    v_clay_frac = v_clay / v_sum,
+    v_silt_frac = v_silt / v_sum,
+    ssa_mean = 6 * (
+      fine * 0.178^2 + med * 0.375^2 + coarse * 1.25^2 +
+        clay * 0.002^2 + silt * 0.0275^2
+    ),
+    ssa_tot = fine / 0.178 / 1.6 + med / 0.375 / 1.7 +
+      coarse / 1.25 / 1.8 + clay / 0.002 / 1.4 + silt / 0.0275 / 1.55
+  )
+
+vgs <- raw_gs %>%
+  transmute(ID, fine = v_fine, med = v_med, coarse = v_coarse,
+            clay = v_clay_frac, silt = v_silt_frac)
+
+write_csv(vgs, derived_file("grain_size_volume_fractions.csv"))
+
+grain_volume_long <- vgs %>%
+  slice_head(n = 30) %>%
+  pivot_longer(-ID, names_to = "variable", values_to = "value")
+
+p_grain_volume <- ggplot(grain_volume_long, aes(x = ID, y = value, fill = variable)) +
+  geom_col() +
+  scale_fill_manual(values = c("#8073ac", "#b2abd2", "#d8daeb", "#fdb863", "#b35806")) +
+  labs(x = NULL, y = "Volume fraction", fill = "Class") +
+  theme_review() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+ggsave(figure_file("process_example_grain_size_weight.pdf"),
+       p_grain_weight, width = 8, height = 5)
+ggsave(figure_file("process_example_grain_size_volume.pdf"),
+       p_grain_volume, width = 10, height = 5)
+
+gs <- raw_gs %>%
+  select(ID, clay, silt, fine, med, coarse, ssa_mean, ssa_tot)
+
+bulk_source_counts <- tibble(
+  source = c("rates", "npoc", "biomass", "mass", "grain_size"),
+  rows = c(nrow(rates), nrow(npoc), nrow(fc), nrow(mass), nrow(gs)),
+  sites = c(
+    n_distinct(unify_site_id(rates$ID)),
+    n_distinct(unify_site_id(npoc$ID)),
+    n_distinct(unify_site_id(fc$ID)),
+    n_distinct(unify_site_id(mass$ID)),
+    n_distinct(unify_site_id(gs$ID))
+  )
+)
+
+write_csv(bulk_source_counts, derived_file("bulk_source_counts.csv"))
+bulk_source_counts
+```
+
+```{r create-position-modeling-files}
+ids_drop <- c("0001", "0003", "0004", "0005", "0045", "0046",
+              "0056", "0059", "0092", "0093", "0096")
+
+extract_position <- function(dat, pattern, value_cols) {
+  dat %>%
+    filter(str_detect(ID, pattern)) %>%
+    mutate(site = str_extract(ID, "[0-9]{4}")) %>%
+    select(site, all_of(value_cols)) %>%
+    filter(!site %in% ids_drop)
+}
+
+build_bulk_position <- function(position) {
+  labels <- c(U = "up", M = "mid", D = "low")
+  rate_pat <- paste0("SED_INC-", position)
+  npoc_pat <- paste0("Sed_Field_ICR-", position)
+  fc_pat <- paste0("FCS-", position)
+  mass_pat <- paste0("SED_INC-", position)
+  gs_pat <- paste0("BULK-", position)
+
+  pos_rates <- extract_position(rates, rate_pat, "rate")
+  pos_npoc <- extract_position(npoc, npoc_pat, "conc")
+  pos_biomass <- extract_position(fc, fc_pat, "biomass")
+  pos_mass <- extract_position(mass, mass_pat, c("sed_mass", "water_mass"))
+  pos_gs <- extract_position(gs, gs_pat,
+                             c("clay", "silt", "fine", "med", "coarse",
+                               "ssa_mean", "ssa_tot"))
+
+  pos_list <- list(pos_rates, pos_npoc, pos_biomass, pos_mass, pos_gs)
+
+  count_summary <- map(pos_list, function(x) {
+    x %>%
+      select(-site) %>%
+      summarise(across(everything(), ~ sum(!is.na(.x))))
+  }) %>%
+    bind_rows() %>%
+    summarise(across(everything(), sum, na.rm = TRUE)) %>%
+    mutate(loc = labels[[position]], .before = 1)
+
+  bulk <- pos_list %>%
+    reduce(full_join, by = "site") %>%
+    select(site, rate, conc, biomass, sed_mass, water_mass,
+           clay, silt, fine, med, coarse, ssa_mean, ssa_tot)
+
+  list(bulk = bulk, count_summary = count_summary)
+}
+
+up_bulk <- build_bulk_position("U")
+mid_bulk <- build_bulk_position("M")
+low_bulk <- build_bulk_position("D")
+
+up_all <- up_data %>%
+  rename(site = ID) %>%
+  inner_join(up_bulk$bulk, by = "site")
+
+mid_all <- mid_data %>%
+  rename(site = ID) %>%
+  inner_join(mid_bulk$bulk, by = "site") %>%
+  mutate(across(where(is.numeric), ~ na_if(.x, -9999)))
+
+low_all <- low_data %>%
+  rename(site = ID) %>%
+  inner_join(low_bulk$bulk, by = "site")
+
+write_csv(up_all, derived_file("up_all.csv"))
+write_csv(mid_all, derived_file("mid_all.csv"))
+write_csv(low_all, derived_file("low_all.csv"))
+
+counts_summary <- bind_rows(
+  up_bulk$count_summary,
+  mid_bulk$count_summary,
+  low_bulk$count_summary
+) %>%
+  transmute(
+    Location = loc,
+    Rate = rate,
+    NPOC = conc,
+    Biomass = biomass,
+    Grain_size = fine,
+    FTICR_MS = c(n_distinct(up_data$ID), n_distinct(mid_data$ID), n_distinct(low_data$ID))
+  )
+
+write_csv(counts_summary, derived_file("counts_summary.csv"))
+
+position_modeling_summary <- tibble(
+  Position = c("U", "M", "D"),
+  file = c("up_all.csv", "mid_all.csv", "low_all.csv"),
+  peak_rows = c(nrow(up_all), nrow(mid_all), nrow(low_all)),
+  sites = c(n_distinct(up_all$site), n_distinct(mid_all$site), n_distinct(low_all$site)),
+  complete_bulk_rows = c(
+    sum(complete.cases(up_all[, c("rate", "conc", "biomass", "sed_mass", "water_mass", "fine")])),
+    sum(complete.cases(mid_all[, c("rate", "conc", "biomass", "sed_mass", "water_mass", "fine")])),
+    sum(complete.cases(low_all[, c("rate", "conc", "biomass", "sed_mass", "water_mass", "fine")]))
+  )
+)
+
+write_csv(position_modeling_summary, derived_file("position_modeling_file_summary.csv"))
+
+counts_long <- counts_summary %>%
+  pivot_longer(-Location, names_to = "Measurement", values_to = "Sites") %>%
+  mutate(
+    Measurement = factor(
+      Measurement,
+      levels = rev(c("FTICR_MS", "Rate", "NPOC", "Biomass", "Grain_size"))
+    )
+  )
+
+p_site_data <- ggplot(counts_long, aes(x = Sites, y = Measurement, fill = Measurement)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  facet_wrap(
+    ~Location,
+    ncol = 1,
+    labeller = as_labeller(c(up = "Upstream", mid = "Midstream", low = "Downstream"))
+  ) +
+  labs(x = "Number of sites", y = NULL) +
+  scale_fill_manual(values = setNames(
+    puor_seq(n_distinct(counts_long$Measurement)),
+    levels(counts_long$Measurement)
+  )) +
+  theme_review() +
+  theme(strip.text = element_text(face = "bold"),
+        panel.grid.major.y = element_blank())
+
+ggsave(figure_file("process_site_data_completeness.pdf"),
+       p_site_data, width = 3.5, height = 5.5)
+
+position_modeling_summary
+p_site_data
+```
+
+```{r load-generated-peak-data}
+peak_data <- bind_rows(
+  up_all %>% mutate(Position = "U"),
+  mid_all %>% mutate(Position = "M"),
+  low_all %>% mutate(Position = "D")
+) %>%
+  mutate(
+    site = unify_site_id(site),
+    water_mass = coalesce(water_mass, 0),
+    conversion_factor = (water_mass + 10) * 0.01 / sed_mass,
+    resp = rate * conversion_factor,
+    respC = resp * (12 / 32),
+    npoc = conc * conversion_factor,
+    inv_npoc = 1 / npoc,
+    biomass_log10 = biomass,
+    biomass_raw = 10^biomass_log10
+  )
+
+peak_data_summary <- peak_data %>%
+  summarise(
+    rows = n(),
+    sites = n_distinct(site),
+    site_positions = n_distinct(paste(site, Position)),
+    complete_core_rows = sum(complete.cases(respC, npoc, biomass_log10, ssa_tot,
+                                            stoichMet_donor, ne))
+  )
+
+write_csv(peak_data_summary, derived_file("peak_data_summary.csv"))
+peak_data_summary
+```
+
+```{r site-level-summary}
+analysis_table <- peak_data %>%
+  filter(lambda > 0) %>%
+  mutate(
+    pr1 = exp(-abs(stoichMet_donor) / npoc),
+    pr2 = (3 / ne) * exp(-abs(stoichMet_donor) / npoc)
+  ) %>%
+  group_by(site, Position) %>%
+  summarise(
+    n_peaks = n(),
+    across(c(delGcat, lambda, ne, stoichMet_donor, stoichMet_acceptor,
+             stoichMet_hco3, C_num, CUE),
+           ~ mean(.x, na.rm = TRUE), .names = "{.col}_mean"),
+    across(c(pr1, pr2),
+           list(q05 = ~ quantile(.x, 0.05, na.rm = TRUE),
+                q50 = ~ quantile(.x, 0.50, na.rm = TRUE),
+                q95 = ~ quantile(.x, 0.95, na.rm = TRUE)),
+           .names = "{.col}_{.fn}"),
+    across(c(rate, conc, sed_mass, water_mass, resp, respC, npoc, inv_npoc,
+             biomass_log10, biomass_raw, clay, silt, fine, med, coarse,
+             ssa_mean, ssa_tot),
+           ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(d50_mm = calc_d50(clay, silt, fine, med, coarse)) %>%
+  ungroup()
+
+dup_check <- analysis_table %>%
+  count(site, Position) %>%
+  filter(n > 1)
+
+stopifnot(nrow(dup_check) == 0)
+
+write_csv(analysis_table, derived_file("s19s_sed_analysis_table.csv"))
+
+analysis_table %>%
+  summarise(
+    rows = n(),
+    sites = n_distinct(site),
+    complete_core = sum(complete.cases(respC, npoc, biomass_log10, ssa_tot,
+                                       stoichMet_donor_mean, ne_mean, d50_mm))
+  )
+```
+
+```{r measurement-completeness-summary}
+measurement_flags <- analysis_table %>%
+  transmute(
+    site,
+    Position,
+    FTICR_thermo = complete.cases(stoichMet_donor_mean, ne_mean, lambda_mean),
+    Respiration = complete.cases(rate, respC),
+    NPOC = complete.cases(conc, npoc),
+    Biomass = complete.cases(biomass_log10),
+    Grain_size = complete.cases(fine, med, coarse, clay, silt, ssa_tot),
+    complete_all_five = FTICR_thermo & Respiration & NPOC & Biomass & Grain_size
+  )
+
+measurement_completeness_summary <- measurement_flags %>%
+  pivot_longer(FTICR_thermo:complete_all_five,
+               names_to = "Measurement",
+               values_to = "Present") %>%
+  group_by(Measurement) %>%
+  summarise(
+    samples = sum(Present),
+    sites = n_distinct(site[Present]),
+    missing_samples = n() - samples,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Measurement = factor(
+      Measurement,
+      levels = c("FTICR_thermo", "Respiration", "NPOC", "Biomass",
+                 "Grain_size", "complete_all_five")
+    )
+  ) %>%
+  arrange(Measurement)
+
+write_csv(measurement_completeness_summary,
+          derived_file("measurement_completeness_summary.csv"))
+
+measurement_completeness_summary
+```
+

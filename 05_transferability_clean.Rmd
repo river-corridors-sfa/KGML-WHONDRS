@@ -1,0 +1,705 @@
+---
+title: "07 Transferability Analysis"
+author: "Jianqiu Zheng"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+source("R/helpers.R")
+library(rsample)
+library(ranger)
+library(xgboost)
+library(caret)
+library(patchwork)
+
+set.seed(42)
+rf_trees <- 600
+spatial_vh0 <- 0.50
+spatial_vh0_label <- "0.50"
+```
+
+## Purpose
+
+This workflow tests model transferability using leave-one-site-out validation.
+For each held-out site, models are trained on all other sites, predicted on the
+held-out site, and compared with the held-out site's nearest environmental and
+geographic distance to the training domain.
+
+The analysis focuses on Bulk and FTICR predictor sets because NPOC-only models
+were already shown to have limited skill. Environmental distance is calculated
+separately in each model's predictor domain, while geographic distance is
+calculated from site coordinates.
+
+## 1. Data and Predictor Sets
+
+```{r load-data}
+mech <- read_csv(derived_file("mechanistic_predictions.csv"),
+                 col_types = cols(site = col_character()))
+
+ft <- read_csv(raw_file("fticr_features.csv"),
+               col_types = cols(site = col_character()))
+
+metadata <- read_csv(raw_file("v4_WHONDRS_S19S_Metadata.csv"),
+                     show_col_types = FALSE) %>%
+  filter(Country == "USA") %>%
+  transmute(
+    site = unify_site_id(Sample_ID),
+    Latitude = suppressWarnings(as.numeric(MS_Latitude_dec.deg)),
+    Longitude = suppressWarnings(as.numeric(MS_Longitude_dec.deg))
+  ) %>%
+  filter(!is.na(site), is.finite(Latitude), is.finite(Longitude)) %>%
+  distinct(site, .keep_all = TRUE)
+
+fticr_cols <- c(
+  "n_peaks", "shannon",
+  "NOSC_med", "NOSC_iqr", "NOSC_mean", "NOSC_p10", "NOSC_p90",
+  "NOSC_range90", "DBE_med", "DBE_mean", "DBE_iqr", "AI_med", "AI_iqr",
+  "delG_med", "delG_iqr", "lambda_med", "lambda_iqr", "Cnum_med",
+  "Cnum_iqr", "frac_NOSC_pos", "frac_NOSC_low", "frac_AI_high",
+  "DBE_C_ratio_mean", "frac_ConHC", "frac_Lipid", "frac_AminoSugar",
+  "frac_Protein", "frac_Tannin", "frac_UnsatHC", "frac_Lignin",
+  "frac_Carb", "frac_Other", "ratio_Protein_Lignin",
+  "ratio_Lipid_Carb", "ratio_UnsatHC_ConHC"
+)
+
+fticr_available <- intersect(fticr_cols, names(ft))
+
+analysis_base <- mech %>%
+  select(-any_of(fticr_available)) %>%
+  left_join(
+    ft %>% select(site, Position, all_of(fticr_available)),
+    by = c("site", "Position")
+  ) %>%
+  left_join(metadata, by = "site") %>%
+  mutate(
+    log_npoc = log10(npoc),
+    inv_npoc = 1 / npoc,
+    logR_obs = safe_log10(respC)
+  ) %>%
+  filter(
+    complete.cases(site, Position, respC, npoc, log_npoc, inv_npoc,
+                   biomass_log10, stoichMet_donor_mean, Vh,
+                   Latitude, Longitude),
+    respC > 0, npoc > 0
+  )
+
+npoc_predictors <- c("npoc", "inv_npoc", "log_npoc")
+
+bulk_predictors <- c(
+  "npoc", "inv_npoc", "log_npoc",
+  "biomass_log10", "delGcat_mean", "lambda_mean", "ne_mean",
+  "stoichMet_donor_mean", "clay", "silt", "fine", "med", "coarse",
+  "ssa_tot", "d50_mm"
+)
+
+predictor_spec <- tribble(
+  ~Predictor_set, ~base_predictors, ~include_fticr,
+  "Bulk", list(bulk_predictors), FALSE,
+  "FTICR", list(npoc_predictors), TRUE
+)
+
+analysis_base %>%
+  summarise(samples = n(), sites = n_distinct(site))
+```
+
+## 2. Modeling Helpers
+
+```{r helpers}
+make_loso_folds_clean <- function(dat) {
+  sites <- sort(unique(dat$site))
+  splits <- lapply(sites, function(s) {
+    make_splits(
+      list(analysis = which(dat$site != s), assessment = which(dat$site == s)),
+      dat
+    )
+  })
+
+  tibble(splits = splits, id = paste0("LOSO_", sites), holdout_site = sites)
+}
+
+fold_id_clean <- function(folds, i) {
+  if ("id" %in% names(folds)) as.character(folds$id[[i]]) else paste0("Fold", i)
+}
+
+mean_impute_from_train_clean <- function(train_df, test_df, predictors) {
+  train_out <- train_df
+  test_out <- test_df
+
+  for (nm in predictors) {
+    fill <- mean(train_out[[nm]], na.rm = TRUE)
+    if (!is.finite(fill)) fill <- 0
+    train_out[[nm]][!is.finite(train_out[[nm]]) | is.na(train_out[[nm]])] <- fill
+    test_out[[nm]][!is.finite(test_out[[nm]]) | is.na(test_out[[nm]])] <- fill
+  }
+
+  list(train = train_out, test = test_out)
+}
+
+scale_from_train_clean <- function(train_df, test_df, predictors) {
+  train_out <- train_df
+  test_out <- test_df
+
+  for (nm in predictors) {
+    center <- mean(train_out[[nm]], na.rm = TRUE)
+    spread <- sd(train_out[[nm]], na.rm = TRUE)
+    if (!is.finite(center)) center <- 0
+    if (!is.finite(spread) || spread == 0) spread <- 1
+    train_out[[nm]] <- (train_out[[nm]] - center) / spread
+    test_out[[nm]] <- (test_out[[nm]] - center) / spread
+  }
+
+  list(train = train_out, test = test_out)
+}
+
+prune_fticr_from_train <- function(train_df, candidates, cutoff = 0.80) {
+  candidates <- candidates[candidates %in% names(train_df)]
+  candidates <- candidates[vapply(train_df[candidates], is.numeric, logical(1))]
+
+  if (length(candidates) < 2) return(candidates)
+
+  complete_counts <- vapply(train_df[candidates], function(x) {
+    sum(is.finite(x))
+  }, numeric(1))
+  candidates <- candidates[complete_counts >= 5]
+  if (length(candidates) < 2) return(candidates)
+
+  corr_mat <- suppressWarnings(cor(train_df[, candidates, drop = FALSE],
+                                   use = "pairwise.complete.obs"))
+  corr_mat[!is.finite(corr_mat)] <- 0
+  high_corr <- caret::findCorrelation(corr_mat, cutoff = cutoff)
+  if (length(high_corr) > 0) candidates[-high_corr] else candidates
+}
+
+add_fixed_vh0_mechanistic <- function(dat, fixed_vh0) {
+  dat %>%
+    mutate(
+      Vh0 = fixed_vh0,
+      R_mech = exp(-abs(stoichMet_donor_mean) / (fixed_vh0 * npoc)) *
+        biomass_log10,
+      logR_mech = safe_log10(R_mech),
+      dR = logR_obs - logR_mech
+    )
+}
+
+complete_for_predictor_set <- function(dat, base_predictors, include_fticr) {
+  required <- base_predictors
+  if (include_fticr) required <- c(required, fticr_available)
+
+  dat %>%
+    filter(if_all(all_of(required), is.finite))
+}
+
+fold_predictors <- function(train_df, base_predictors, include_fticr) {
+  if (!include_fticr) return(base_predictors)
+  unique(c(base_predictors, prune_fticr_from_train(train_df, fticr_available)))
+}
+
+fit_rf_predict <- function(train_df, test_df, response, predictors) {
+  predictors <- predictors[predictors %in% names(train_df)]
+  fixed <- mean_impute_from_train_clean(train_df, test_df, predictors)
+
+  fit <- ranger(
+    formula = reformulate(predictors, response = response),
+    data = fixed$train,
+    num.trees = rf_trees,
+    min.node.size = 5,
+    importance = "permutation",
+    seed = 7
+  )
+
+  predict(fit, data = fixed$test)$predictions
+}
+
+fit_xgb_predict <- function(train_df, test_df, response, predictors) {
+  predictors <- predictors[predictors %in% names(train_df)]
+  fixed <- mean_impute_from_train_clean(train_df, test_df, predictors)
+  scaled <- scale_from_train_clean(fixed$train, fixed$test, predictors)
+
+  dtrain <- xgb.DMatrix(
+    data = as.matrix(scaled$train[, predictors, drop = FALSE]),
+    label = scaled$train[[response]]
+  )
+  dtest <- xgb.DMatrix(data = as.matrix(scaled$test[, predictors, drop = FALSE]))
+
+  set.seed(7)
+  fit <- xgb.train(
+    params = list(
+      objective = "reg:squarederror",
+      eta = 0.04,
+      max_depth = 2,
+      subsample = 0.8,
+      colsample_bytree = 0.8,
+      min_child_weight = 3
+    ),
+    data = dtrain,
+    nrounds = 120,
+    verbose = 0
+  )
+
+  as.numeric(predict(fit, dtest))
+}
+```
+
+## 3. Transfer Distance Metrics
+
+```{r environmental-distance-helper}
+calc_nearest_environmental_distance <- function(train_df, test_df, predictors) {
+  fixed <- mean_impute_from_train_clean(train_df, test_df, predictors)
+
+  train_site_env <- fixed$train %>%
+    group_by(site) %>%
+    summarise(across(all_of(predictors), ~ mean(.x, na.rm = TRUE)),
+              .groups = "drop")
+
+  test_site_env <- fixed$test %>%
+    group_by(site) %>%
+    summarise(across(all_of(predictors), ~ mean(.x, na.rm = TRUE)),
+              .groups = "drop")
+
+  centers <- map_dbl(train_site_env[predictors], ~ mean(.x, na.rm = TRUE))
+  spreads <- map_dbl(train_site_env[predictors], ~ sd(.x, na.rm = TRUE))
+  spreads[!is.finite(spreads) | spreads == 0] <- 1
+
+  train_scaled <- sweep(as.matrix(train_site_env[predictors]), 2, centers, "-")
+  train_scaled <- sweep(train_scaled, 2, spreads, "/")
+  test_scaled <- sweep(as.matrix(test_site_env[predictors]), 2, centers, "-")
+  test_scaled <- sweep(test_scaled, 2, spreads, "/")
+
+  env_dist <- map_dbl(seq_len(nrow(test_scaled)), function(j) {
+    d <- sqrt(rowSums((sweep(train_scaled, 2, test_scaled[j, ], "-"))^2))
+    min(d, na.rm = TRUE)
+  })
+
+  tibble(
+    site = test_site_env$site,
+    environmental_dissimilarity = env_dist,
+    n_train_sites = nrow(train_site_env),
+    n_environmental_predictors = length(predictors)
+  )
+}
+
+haversine_km <- function(lon1, lat1, lon2, lat2) {
+  radius_km <- 6371
+  to_rad <- pi / 180
+  lon1 <- lon1 * to_rad
+  lat1 <- lat1 * to_rad
+  lon2 <- lon2 * to_rad
+  lat2 <- lat2 * to_rad
+
+  dlon <- lon2 - lon1
+  dlat <- lat2 - lat1
+  a <- sin(dlat / 2)^2 + cos(lat1) * cos(lat2) * sin(dlon / 2)^2
+  2 * radius_km * atan2(sqrt(a), sqrt(1 - a))
+}
+
+calc_nearest_geographic_distance <- function(train_df, test_df) {
+  train_sites <- train_df %>%
+    group_by(site) %>%
+    summarise(
+      Latitude = mean(Latitude, na.rm = TRUE),
+      Longitude = mean(Longitude, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  test_sites <- test_df %>%
+    group_by(site) %>%
+    summarise(
+      Latitude = mean(Latitude, na.rm = TRUE),
+      Longitude = mean(Longitude, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  nearest_km <- map_dbl(seq_len(nrow(test_sites)), function(i) {
+    d <- haversine_km(
+      lon1 = test_sites$Longitude[[i]],
+      lat1 = test_sites$Latitude[[i]],
+      lon2 = train_sites$Longitude,
+      lat2 = train_sites$Latitude
+    )
+    min(d, na.rm = TRUE)
+  })
+
+  test_sites %>%
+    transmute(
+      site,
+      Latitude,
+      Longitude,
+      nearest_training_distance_km = nearest_km,
+      n_train_sites_geo = nrow(train_sites)
+    )
+}
+```
+
+## 4. Run LOSO Transfer Test
+
+```{r run-loso-transfer}
+run_loso_for_predictor_set <- function(spec_row) {
+  predictor_set <- spec_row$Predictor_set
+  base_predictors <- unlist(spec_row$base_predictors[[1]], use.names = FALSE)
+  include_fticr <- spec_row$include_fticr
+
+  dat <- complete_for_predictor_set(
+    analysis_base, base_predictors, include_fticr
+  )
+
+  folds <- make_loso_folds_clean(dat)
+  out <- vector("list", nrow(folds))
+  dist_out <- vector("list", nrow(folds))
+  geo_out <- vector("list", nrow(folds))
+
+  for (i in seq_len(nrow(folds))) {
+    train_raw <- analysis(folds$splits[[i]])
+    test_raw <- assessment(folds$splits[[i]])
+    fold_id <- fold_id_clean(folds, i)
+    holdout_site <- as.character(folds$holdout_site[[i]])
+
+    train_vh <- train_raw %>% add_fixed_vh0_mechanistic(spatial_vh0)
+    test_vh <- test_raw %>% add_fixed_vh0_mechanistic(spatial_vh0)
+    predictors <- fold_predictors(train_vh, base_predictors, include_fticr)
+
+    pure_rf <- fit_rf_predict(train_raw, test_raw, "logR_obs", predictors)
+    pure_xgb <- fit_xgb_predict(train_raw, test_raw, "logR_obs", predictors)
+    kgml_dR <- fit_rf_predict(train_vh, test_vh, "dR", predictors)
+
+    out[[i]] <- bind_rows(
+      test_raw %>%
+        transmute(
+          site, Position, fold_id = fold_id, holdout_site = holdout_site,
+          Predictor_set = predictor_set,
+          Model = paste("Pure RF", predictor_set),
+          Vh0_label = NA_character_,
+          Vh0 = NA_real_,
+          logR_obs,
+          logR_pred = pure_rf
+        ),
+      test_raw %>%
+        transmute(
+          site, Position, fold_id = fold_id, holdout_site = holdout_site,
+          Predictor_set = predictor_set,
+          Model = paste("Pure XGBoost", predictor_set),
+          Vh0_label = NA_character_,
+          Vh0 = NA_real_,
+          logR_obs,
+          logR_pred = pure_xgb
+        ),
+      test_vh %>%
+        transmute(
+          site, Position, fold_id = fold_id, holdout_site = holdout_site,
+          Predictor_set = predictor_set,
+          Model = paste("KGML RF", predictor_set),
+          Vh0_label = spatial_vh0_label,
+          Vh0 = spatial_vh0,
+          logR_obs,
+          logR_pred = logR_mech + kgml_dR
+        )
+    )
+
+    dist_out[[i]] <- calc_nearest_environmental_distance(
+      train_vh, test_vh, predictors
+    ) %>%
+      mutate(
+        fold_id = fold_id,
+        holdout_site = holdout_site,
+        Predictor_set = predictor_set
+      )
+
+    geo_out[[i]] <- calc_nearest_geographic_distance(train_vh, test_vh) %>%
+      mutate(
+        fold_id = fold_id,
+        holdout_site = holdout_site,
+        Predictor_set = predictor_set
+      )
+  }
+
+  list(
+    predictions = bind_rows(out),
+    distances = bind_rows(dist_out),
+    geographic_distances = bind_rows(geo_out)
+  )
+}
+
+loso_results <- map(
+  seq_len(nrow(predictor_spec)),
+  ~ run_loso_for_predictor_set(predictor_spec[.x, ])
+)
+
+envdist_loso_predictions <- map_dfr(loso_results, "predictions") %>%
+  mutate(
+    R_obs = 10^logR_obs,
+    R_pred = 10^logR_pred,
+    residual_log = logR_obs - logR_pred
+  )
+
+envdist_loso_distances <- map_dfr(loso_results, "distances")
+envdist_loso_geographic_distances <- map_dfr(loso_results, "geographic_distances")
+
+write_csv(envdist_loso_predictions,
+          derived_file("transferability_loso_predictions.csv"))
+write_csv(envdist_loso_distances,
+          derived_file("transferability_environmental_dissimilarity.csv"))
+write_csv(envdist_loso_geographic_distances,
+          derived_file("transferability_geographic_distance.csv"))
+
+envdist_loso_stats <- envdist_loso_predictions %>%
+  group_by(Predictor_set, Model, Vh0_label, Vh0) %>%
+  group_modify(~ model_stats(.x$logR_obs, .x$logR_pred)) %>%
+  ungroup() %>%
+  select(-R2) %>%
+  arrange(Predictor_set, Model)
+
+write_csv(envdist_loso_stats,
+          derived_file("transferability_loso_model_stats.csv"))
+
+envdist_loso_stats
+```
+
+## 5. LOSO Model Performance Summary
+
+```{r loso-performance-lollipop}
+envdist_best_pure <- envdist_loso_stats %>%
+  filter(str_detect(Model, "^Pure ")) %>%
+  group_by(Predictor_set) %>%
+  slice_min(RMSE, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  transmute(
+    Predictor_set,
+    best_pure_model = Model,
+    best_pure_RMSE = RMSE,
+    best_pure_CCC = CCC
+  )
+
+transferability_model_summary <- bind_rows(
+  envdist_loso_stats %>%
+    filter(str_detect(Model, "^KGML ")) %>%
+    mutate(Model_display = "KGML RF"),
+  envdist_loso_stats %>%
+    inner_join(envdist_best_pure,
+               by = c("Predictor_set", "Model" = "best_pure_model")) %>%
+    mutate(Model_display = "Best pure RF/XGBoost")
+) %>%
+  mutate(
+    Predictor_set = factor(Predictor_set, levels = c("Bulk", "FTICR")),
+    Model_display = factor(
+      Model_display,
+      levels = c("Best pure RF/XGBoost", "KGML RF")
+    )
+  )
+
+transferability_metric_long <- transferability_model_summary %>%
+  select(Predictor_set, Model, Model_display, RMSE, CCC) %>%
+  pivot_longer(c(RMSE, CCC), names_to = "Metric", values_to = "Value") %>%
+  mutate(Metric = factor(Metric, levels = c("RMSE", "CCC")))
+
+write_csv(transferability_model_summary,
+          derived_file("transferability_loso_model_summary.csv"))
+write_csv(transferability_metric_long,
+          derived_file("transferability_loso_metric_long.csv"))
+
+p_loso_performance <- ggplot(
+  transferability_metric_long,
+  aes(x = Value, y = Predictor_set, color = Model_display)
+) +
+  geom_segment(
+    aes(x = 0, xend = Value, yend = Predictor_set),
+    linewidth = 0.65,
+    alpha = 0.7,
+    position = position_dodge(width = 0.55)
+  ) +
+  geom_point(position = position_dodge(width = 0.55), size = 2.4) +
+  facet_wrap(~ Metric, scales = "free_x", nrow = 1) +
+  scale_color_manual(values = c(
+    "KGML RF" = puor$purple,
+    "Best pure RF/XGBoost" = puor$orange
+  )) +
+  labs(
+    x = NULL,
+    y = NULL,
+    color = NULL
+  ) +
+  theme_review() +
+  theme(legend.position = "right")
+
+ggsave(figure_file("transferability_loso_performance_lollipop.pdf"),
+       p_loso_performance, width = 7.8, height = 2.8)
+
+p_loso_performance
+```
+
+## 6. Error Versus Transfer Distance
+
+```{r error-distance-analysis}
+envdist_site_errors <- envdist_loso_predictions %>%
+  mutate(abs_error = abs(logR_obs - logR_pred)) %>%
+  group_by(Predictor_set, Model, Vh0_label, Vh0, fold_id, holdout_site, site) %>%
+  summarise(
+    n_samples = n(),
+    mean_abs_error = mean(abs_error, na.rm = TRUE),
+    RMSE = sqrt(mean((logR_obs - logR_pred)^2, na.rm = TRUE)),
+    Bias = mean(logR_pred - logR_obs, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    envdist_loso_distances,
+    by = c("Predictor_set", "fold_id", "holdout_site", "site")
+  ) %>%
+  left_join(
+    envdist_loso_geographic_distances,
+    by = c("Predictor_set", "fold_id", "holdout_site", "site")
+  ) %>%
+  left_join(envdist_best_pure, by = "Predictor_set") %>%
+  mutate(
+    Model_display = case_when(
+      str_detect(Model, "^KGML ") ~ "KGML RF",
+      Model == best_pure_model ~ "Best pure RF/XGBoost",
+      TRUE ~ NA_character_
+    ),
+    Predictor_set = factor(Predictor_set, levels = c("Bulk", "FTICR"))
+  )
+
+envdist_plot_data <- envdist_site_errors %>%
+  filter(!is.na(Model_display))
+
+envdist_error_summary <- envdist_plot_data %>%
+  group_by(Predictor_set, Model, Model_display) %>%
+  summarise(
+    n_sites = n_distinct(site),
+    spearman_rho = suppressWarnings(
+      cor(mean_abs_error, environmental_dissimilarity,
+          use = "complete.obs", method = "spearman")
+    ),
+    linear_slope = coef(lm(mean_abs_error ~ environmental_dissimilarity))[2],
+    .groups = "drop"
+  ) %>%
+  arrange(Predictor_set, Model_display)
+
+geo_error_summary <- envdist_plot_data %>%
+  group_by(Predictor_set, Model, Model_display) %>%
+  summarise(
+    n_sites = n_distinct(site),
+    spearman_rho = suppressWarnings(
+      cor(mean_abs_error, nearest_training_distance_km,
+          use = "complete.obs", method = "spearman")
+    ),
+    linear_slope = coef(lm(mean_abs_error ~ nearest_training_distance_km))[2],
+    .groups = "drop"
+  ) %>%
+  arrange(Predictor_set, Model_display)
+
+transfer_distance_summary <- bind_rows(
+  envdist_error_summary %>%
+    mutate(Distance_type = "Environmental dissimilarity"),
+  geo_error_summary %>%
+    mutate(Distance_type = "Geographic distance")
+) %>%
+  mutate(
+    Distance_type = factor(
+      Distance_type,
+      levels = c("Environmental dissimilarity", "Geographic distance")
+    )
+  )
+
+envdist_competition <- envdist_loso_stats %>%
+  filter(str_detect(Model, "^KGML ")) %>%
+  left_join(envdist_best_pure, by = "Predictor_set") %>%
+  mutate(
+    delta_RMSE_vs_best_pure = RMSE - best_pure_RMSE,
+    delta_CCC_vs_best_pure = CCC - best_pure_CCC,
+    beats_best_pure = delta_RMSE_vs_best_pure < 0
+  )
+
+write_csv(envdist_site_errors,
+          derived_file("transferability_loso_site_errors.csv"))
+write_csv(envdist_error_summary,
+          derived_file("transferability_error_dissimilarity_summary.csv"))
+write_csv(geo_error_summary,
+          derived_file("transferability_error_geographic_distance_summary.csv"))
+write_csv(transfer_distance_summary,
+          derived_file("transferability_distance_summary.csv"))
+write_csv(envdist_competition,
+          derived_file("transferability_kgml_vs_best_pure.csv"))
+
+p_error_distance <- ggplot(
+  envdist_plot_data,
+  aes(x = environmental_dissimilarity, y = mean_abs_error,
+      color = Model_display)
+) +
+  geom_point(alpha = 0.72, size = 2) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.85) +
+  facet_wrap(~ Predictor_set, scales = "free_x", nrow = 1) +
+  scale_color_manual(values = c(
+    "KGML RF" = puor$purple,
+    "Best pure RF/XGBoost" = puor$orange
+  )) +
+  labs(
+    x = "Nearest-training environmental dissimilarity",
+    y = "Held-out site mean absolute error",
+    color = NULL
+  ) +
+  theme_review() +
+  theme(legend.position = "right")
+ggsave(figure_file("environment_dissimilarity_scatter.pdf"),
+       p_error_distance, width = 7.8, height = 3)
+
+
+p_error_geo_distance <- ggplot(
+  envdist_plot_data,
+  aes(x = nearest_training_distance_km, y = mean_abs_error,
+      color = Model_display)
+) +
+  geom_point(alpha = 0.72, size = 2) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.85) +
+  facet_wrap(~ Predictor_set, scales = "free_x", nrow = 1) +
+  scale_color_manual(values = c(
+    "KGML RF" = puor$purple,
+    "Best pure RF/XGBoost" = puor$orange
+  )) +
+  labs(
+    x = "Nearest-training geographic distance (km)",
+    y = "Held-out site mean absolute error",
+    color = NULL
+  ) +
+  theme_review() +
+  theme(legend.position = "right")
+ggsave(figure_file("geographic_distance_scatter.pdf"),
+       p_error_geo_distance, width = 7.8, height = 3)
+
+
+
+p_error_rho <- ggplot(
+  transfer_distance_summary,
+  aes(x = Predictor_set, y = spearman_rho, fill = Model_display)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.35) +
+  geom_col(position = position_dodge(width = 0.68),
+           width = 0.58, color = "black", linewidth = 0.2) +
+  facet_wrap(~ Distance_type, nrow = 1) +
+  scale_fill_manual(values = c(
+    "KGML RF" = puor$purple,
+    "Best pure RF/XGBoost" = puor$orange
+  )) +
+  labs(
+    x = NULL,
+    y = "Error-distance correlation",
+    fill = NULL
+  ) +
+  theme_review() +
+  theme(legend.position = "right")
+
+ggsave(figure_file("transferability_distance_rho_summary.pdf"),
+       p_error_rho, width = 7.8, height = 3)
+
+p_section35_transferability <- p_loso_performance /
+  p_error_distance /
+  p_error_geo_distance /
+  p_error_rho +
+  plot_layout(heights = c(0.9, 1, 1, 0.9)) +
+  plot_annotation(tag_levels = "a")
+
+ggsave(figure_file("section35_transferability_summary.pdf"),
+       p_section35_transferability, width = 8.0, height = 10.2)
+
+p_section35_transferability
+
+```

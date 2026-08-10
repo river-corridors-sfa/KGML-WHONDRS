@@ -1,0 +1,746 @@
+---
+title: "02 Mechanistic Model"
+author: "Jianqiu Zheng"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+source("R/helpers.R")
+```
+
+## Purpose
+
+This notebook follows the mechanistic-model section of the original `S19S_sed_model_graph.Rmd` workflow. It does two things:
+
+1. Recreates the theoretical perturbation plots used for the original Figure 2.
+2. Recreates the measured mechanistic scenarios used for the original Figure 3.
+
+It also keeps the downstream output `derived/mechanistic_predictions.csv`, which is used by the KGML residual-learning workflows.
+
+## Theoretical Mechanistic Perturbations
+
+```{r theoretical-perturbations}
+set.seed(10)
+
+Vmax <- 1.0
+Cb <- 1.0
+y <- 1.0
+p <- 1.0
+
+inv_oc <- seq(0, 5, length.out = 500)
+
+df_the <- tibble(
+  inv_OC = inv_oc,
+  R = Vmax * Cb * exp(-(y / p) * inv_oc)
+)
+
+p_the_npoc <- ggplot(df_the, aes(x = inv_OC, y = R)) +
+  geom_point(shape = 1, size = 1, color = puor$purple) +
+  labs(x = "1/NPOC", y = expression(R[pred])) +
+  theme_review()
+
+df_y <- tibble(
+  inv_OC = inv_oc,
+  y_abs = runif(500, min = 0.1, max = 1),
+  R = Vmax * Cb * exp(-(y_abs / p) * inv_oc)
+)
+
+p_the_y_curve <- ggplot() +
+  geom_point(data = df_y, aes(x = inv_OC, y = R),
+             shape = 1, size = 1, color = puor$orange) +
+  geom_line(data = df_the, aes(x = inv_OC, y = R),
+            linewidth = 0.8, color = puor$purple) +
+  labs(x = "1/NPOC", y = expression(R[pred])) +
+  theme_review()
+
+p_the_y <- ggplot(df_y, aes(x = y_abs, y = R)) +
+  geom_point(shape = 1, size = 1, color = puor$orange) +
+  labs(x = "|yi|", y = expression(R[pred])) +
+  theme_review()
+
+df_cb <- tibble(
+  inv_OC = inv_oc,
+  Cb = rnorm(500, mean = 1, sd = 0.25),
+  R = Vmax * Cb * exp(-(1 / p) * inv_oc)
+)
+
+p_the_cb_curve <- ggplot() +
+  geom_point(data = df_cb, aes(x = inv_OC, y = R),
+             shape = 1, size = 1, color = puor$orange) +
+  geom_line(data = df_the, aes(x = inv_OC, y = R),
+            linewidth = 0.8, color = puor$purple) +
+  labs(x = "1/NPOC", y = expression(R[pred])) +
+  theme_review()
+
+p_the_cb <- ggplot(df_cb, aes(x = Cb, y = R)) +
+  geom_point(shape = 1, size = 1, color = puor$orange) +
+  labs(x = "Cb", y = expression(R[pred])) +
+  theme_review()
+
+df_vh <- tibble(
+  inv_OC = inv_oc,
+  Vh = runif(500, min = 0.1, max = 1),
+  R = rescale01(Vmax * exp(-(1 / Vh) * inv_oc))
+)
+
+p_the_vh_curve <- ggplot() +
+  geom_point(data = df_vh, aes(x = inv_OC, y = R),
+             shape = 1, size = 1, color = puor$orange) +
+  geom_line(data = df_the, aes(x = inv_OC, y = R),
+            linewidth = 0.8, color = puor$purple) +
+  labs(x = "1/NPOC", y = expression(R[pred])) +
+  theme_review()
+
+p_the_vh <- ggplot(df_vh, aes(x = Vh, y = R)) +
+  geom_point(shape = 1, size = 1, color = puor$orange) +
+  labs(x = "Vh", y = expression(R[pred])) +
+  theme_review()
+
+ggsave(figure_file("mechanistic_theory_npoc.pdf"), p_the_npoc,
+       width = 3.5, height = 3)
+ggsave(figure_file("mechanistic_theory_y.pdf"), p_the_y,
+       width = 3.5, height = 3)
+ggsave(figure_file("mechanistic_theory_cb.pdf"), p_the_cb,
+       width = 3.5, height = 3)
+ggsave(figure_file("mechanistic_theory_vh.pdf"), p_the_vh,
+       width = 3.5, height = 3)
+
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  p_theory_combined <- (p_the_npoc | p_the_y_curve) /
+    (p_the_cb_curve | p_the_vh_curve)
+
+  ggsave(figure_file("mechanistic_revised_figure2_theory.pdf"),
+         p_theory_combined, width = 7, height = 5.6)
+  p_theory_combined
+} else {
+  p_the_npoc
+  p_the_y_curve
+  p_the_cb_curve
+  p_the_vh_curve
+}
+```
+
+## Load Peak-Level Modeling Inputs
+
+```{r load-peak-level-data}
+process_site <- function(path, position, filter_lambda = FALSE) {
+  read_csv(path, col_types = cols(site = col_character())) %>%
+    mutate(
+      Position = position,
+      factor = (water_mass + 10) * 0.01 / sed_mass,
+      respC = rate * factor * (12 / 32),
+      npoc = conc * factor
+    ) %>%
+    { if (filter_lambda) filter(., lambda > 0) else . } %>%
+    select(-factor)
+}
+
+up_v <- process_site(derived_file("up_all.csv"), "U", filter_lambda = TRUE)
+mid_v <- process_site(derived_file("mid_all.csv"), "M", filter_lambda = TRUE)
+low_v <- process_site(derived_file("low_all.csv"), "D", filter_lambda = TRUE)
+
+all_data <- bind_rows(
+  up_v %>% mutate(level = "up"),
+  mid_v %>% mutate(level = "mid"),
+  low_v %>% mutate(level = "low")
+)
+
+all_data %>%
+  summarise(
+    peak_rows = n(),
+    sites = n_distinct(site),
+    site_positions = n_distinct(paste(site, Position)),
+    complete_rows = sum(complete.cases(rate, conc, biomass, sed_mass,
+                                       water_mass, npoc, respC, ssa_tot,
+                                       stoichMet_donor, ne, lambda))
+  )
+```
+
+## Scenario 1: FTICR Thermodynamics and NPOC
+
+```{r scenario-1-thermo-npoc}
+summary_all <- all_data %>%
+  drop_na() %>%
+  mutate(
+    pr1 = exp(-abs(stoichMet_donor) / npoc),
+    pr2 = (3 / ne) * exp(-abs(stoichMet_donor) / npoc)
+  ) %>%
+  group_by(site, Position) %>%
+  summarise(
+    across(where(is.numeric) & -any_of(c("pr1", "pr2")),
+           ~ mean(.x, na.rm = TRUE), .names = "{.col}_mean"),
+    across(c(pr1, pr2),
+           list(p05 = ~ quantile(.x, 0.05, na.rm = TRUE),
+                p50 = ~ quantile(.x, 0.50, na.rm = TRUE),
+                p95 = ~ quantile(.x, 0.95, na.rm = TRUE)),
+           .names = "{.col}_{.fn}"),
+    .groups = "drop"
+  ) %>%
+  select(site, Position, everything())
+
+write_csv(summary_all, derived_file("mechanistic_original_summary_all_levels.csv"))
+
+fticr_features <- read_csv(raw_file("fticr_features.csv"),
+                           col_types = cols(site = col_character()))
+
+class_cols <- c(
+  "frac_ConHC", "frac_Lipid", "frac_AminoSugar", "frac_Protein",
+  "frac_Tannin", "frac_UnsatHC", "frac_Lignin", "frac_Carb", "frac_Other"
+)
+
+fticr_site_composition <- fticr_features %>%
+  group_by(site) %>%
+  summarise(
+    n_site_positions = n_distinct(Position),
+    n_peaks = mean(n_peaks, na.rm = TRUE),
+    across(all_of(class_cols), ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+site_order <- fticr_site_composition %>%
+  arrange(as.integer(site)) %>%
+  pull(site)
+
+fticr_site_composition <- fticr_site_composition %>%
+  mutate(site = factor(site, levels = site_order))
+
+fticr_class_long <- fticr_site_composition %>%
+  select(site, all_of(class_cols)) %>%
+  pivot_longer(
+    cols = -site,
+    names_to = "Compound_class",
+    values_to = "Fraction"
+  ) %>%
+  mutate(
+    Compound_class = str_remove(Compound_class, "^frac_"),
+    Compound_class = factor(
+      Compound_class,
+      levels = str_remove(class_cols, "^frac_"),
+      labels = c("Condensed HC", "Lipid", "Amino sugar", "Protein",
+                 "Tannin", "Unsat. HC", "Lignin", "Carbohydrate", "Other")
+    )
+  )
+
+write_csv(fticr_site_composition,
+          derived_file("supplement_fticr_site_composition_summary.csv"))
+write_csv(fticr_class_long,
+          derived_file("supplement_fticr_site_compound_classes.csv"))
+
+p_peak_richness <- ggplot(fticr_site_composition,
+                          aes(x = n_peaks, y = site)) +
+  geom_point(color = puor$purple, size = 1.4) +
+  labs(x = "Number\nof peaks", y = "Site") +
+  theme_review() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 4),
+    axis.ticks.y = element_blank(),
+    panel.grid.major.x = element_line(color = "grey85", linewidth = 0.25)
+  )
+
+p_class_composition <- ggplot(fticr_class_long,
+                              aes(x = Fraction, y = site, fill = Compound_class)) +
+  geom_col(width = 0.85, color = "white", linewidth = 0.08) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0.01))) +
+  scale_fill_manual(values = puor_seq(nlevels(fticr_class_long$Compound_class)),
+                    name = "Compound class") +
+  labs(x = "Compound-class composition", y = NULL) +
+  theme_review() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "right"
+  )
+
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  p_om_variation <- p_peak_richness + p_class_composition +
+    patchwork::plot_layout(widths = c(1.1, 3.2))
+} else {
+  p_om_variation <- p_class_composition
+}
+
+ggsave(figure_file("supplement_fticr_inferred_om_site_variation.pdf"),
+       p_om_variation, width = 8, height = 8.5)
+
+p_om_variation
+
+pr1_cols <- c("pr1_p05", "pr1_p50", "pr1_p95")
+pr2_cols <- c("pr2_p05", "pr2_p50", "pr2_p95")
+rng1 <- range(unlist(summary_all[pr1_cols]), na.rm = TRUE)
+rng2 <- range(unlist(summary_all[pr2_cols]), na.rm = TRUE)
+span1 <- diff(rng1)
+span2 <- diff(rng2)
+
+df_scaled <- summary_all %>%
+  mutate(
+    across(all_of(pr1_cols),
+           ~ if (span1 == 0) 0 else (.x - rng1[1]) / span1,
+           .names = "{.col}_scaled"),
+    across(all_of(pr2_cols),
+           ~ if (span2 == 0) 0 else (.x - rng2[1]) / span2,
+           .names = "{.col}_scaled"),
+    inv_npoc = 1 / npoc_mean
+  )
+
+comp_df <- df_scaled %>%
+  mutate(
+    res_scaled = (respC_mean - min(respC_mean, na.rm = TRUE)) /
+      (max(respC_mean, na.rm = TRUE) - min(respC_mean, na.rm = TRUE))
+  ) %>%
+  select(site, Position, inv_npoc, res_scaled) %>%
+  drop_na()
+
+pr_for_plot <- df_scaled %>%
+  select(site, inv_npoc, matches("^pr[12]_(p05|p50|p95)_scaled$")) %>%
+  pivot_longer(
+    cols = -c(site, inv_npoc),
+    names_to = c("variable", "stat"),
+    names_pattern = "(pr[12])_(p\\d{2})_scaled",
+    values_to = "value"
+  ) %>%
+  pivot_wider(
+    id_cols = c(site, inv_npoc, variable),
+    names_from = stat,
+    values_from = value
+  ) %>%
+  mutate(variable = factor(variable, levels = c("pr1", "pr2")))
+
+p_scen1 <- ggplot() +
+  geom_ribbon(
+    data = pr_for_plot,
+    aes(x = inv_npoc, ymin = p05, ymax = p95, fill = variable),
+    alpha = 0.3
+  ) +
+  geom_point(
+    data = pr_for_plot,
+    aes(x = inv_npoc, y = p50, color = variable, shape = "p50"),
+    size = 2, alpha = 0.9
+  ) +
+  geom_smooth(
+    data = pr_for_plot,
+    aes(x = inv_npoc, y = p50, color = variable),
+    method = "loess", se = FALSE, linewidth = 0.7, show.legend = FALSE
+  ) +
+  geom_point(
+    data = comp_df,
+    aes(x = inv_npoc, y = res_scaled, color = "Observed", shape = "Observed"),
+    size = 2, alpha = 0.9
+  ) +
+  scale_fill_manual(
+    values = c(pr1 = puor$dark_orange, pr2 = puor$orange),
+    name = "Predicted"
+  ) +
+  scale_color_manual(
+    values = c(pr1 = puor$dark_orange, pr2 = puor$orange,
+               Observed = puor$light_purple),
+    breaks = c("pr1", "pr2", "Observed"),
+    labels = c("Chemistry + NPOC", "Chemistry + NPOC + uptake", "Observed"),
+    name = "Series"
+  ) +
+  scale_shape_manual(
+    values = c(p50 = 16, Observed = 16),
+    labels = c("Predicted p50", "Observed"),
+    name = "Points"
+  ) +
+  labs(x = "1/NPOC",
+       y = expression(italic(R)[scaled]~"(Observed & Predicted)")) +
+  theme_review() +
+  theme(legend.position = "right")
+
+ggsave(figure_file("mechanistic_scenario1_thermo_npoc.pdf"),
+       p_scen1, width = 5, height = 3)
+
+mechanistic_scenario1_stats <- bind_rows(
+  model_stats(comp_df$res_scaled,
+              df_scaled %>% select(site, Position, pr1_p50_scaled) %>%
+                left_join(comp_df, by = c("site", "Position")) %>%
+                pull(pr1_p50_scaled)) %>%
+    mutate(Model = "Mechanistic_pr1"),
+  model_stats(comp_df$res_scaled,
+              df_scaled %>% select(site, Position, pr2_p50_scaled) %>%
+                left_join(comp_df, by = c("site", "Position")) %>%
+                pull(pr2_p50_scaled)) %>%
+    mutate(Model = "Mechanistic_pr2")
+) %>%
+  select(Model, everything())
+
+write_csv(mechanistic_scenario1_stats,
+          derived_file("mechanistic_scenario1_stats.csv"))
+
+p_scen1
+mechanistic_scenario1_stats
+```
+
+## Scenario 2: Add Microbial Biomass
+
+```{r scenario-2-biomass}
+df_biomass <- df_scaled %>%
+  mutate(
+    pr3 = exp(-abs(1) / npoc_mean) * biomass_mean,
+    pr4 = pr2_p05 * biomass_mean,
+    pr5 = pr2_p50 * biomass_mean,
+    pr6 = pr2_p95 * biomass_mean
+  ) %>%
+  drop_na()
+
+rng456 <- range(c(df_biomass$pr4, df_biomass$pr5, df_biomass$pr6),
+                na.rm = TRUE)
+span456 <- diff(rng456)
+
+df_biomass <- df_biomass %>%
+  mutate(
+    pr4_scaled = if (span456 == 0) 0 else (pr4 - rng456[1]) / span456,
+    pr5_scaled = if (span456 == 0) 0 else (pr5 - rng456[1]) / span456,
+    pr6_scaled = if (span456 == 0) 0 else (pr6 - rng456[1]) / span456,
+    pr3_scaled = rescale01(pr3),
+    res_scaled = rescale01(respC_mean)
+  ) %>%
+  select(site, Position, inv_npoc, res_scaled, pr3_scaled,
+         pr4_scaled, pr5_scaled, pr6_scaled, biomass_mean) %>%
+  rename(Obv = res_scaled, Pred3 = pr3_scaled, Pred4 = pr4_scaled,
+         Pred5 = pr5_scaled, Pred6 = pr6_scaled, biomass = biomass_mean)
+
+p_scen2 <- ggplot() +
+  geom_ribbon(
+    data = df_biomass,
+    aes(x = inv_npoc, ymin = Pred4, ymax = Pred6, fill = "Pred p05-p95"),
+    alpha = 0.3
+  ) +
+  geom_point(
+    data = df_biomass,
+    aes(x = inv_npoc, y = Pred5, color = "Pred p50"),
+    size = 2, alpha = 0.8
+  ) +
+  geom_point(
+    data = df_biomass,
+    aes(x = inv_npoc, y = Pred3, color = "Biomass + NPOC"),
+    size = 2, shape = 16
+  ) +
+  geom_point(
+    data = df_biomass,
+    aes(x = inv_npoc, y = Obv, color = "Observed"),
+    size = 2, alpha = 0.8, shape = 16
+  ) +
+  scale_fill_manual(values = c("Pred p05-p95" = puor$light_orange),
+                    name = NULL) +
+  scale_color_manual(
+    values = c("Pred p50" = puor$orange,
+               "Biomass + NPOC" = puor$dark_orange,
+               "Observed" = puor$light_purple),
+    name = NULL
+  ) +
+  labs(x = "1/NPOC",
+       y = expression(italic(R)[scaled]~"(Observed & Predicted)")) +
+  theme_review() +
+  theme(legend.position = "right")
+
+ggsave(figure_file("mechanistic_scenario2_biomass.pdf"),
+       p_scen2, width = 5.2, height = 3)
+
+mechanistic_scenario2_stats <- bind_rows(
+  model_stats(df_biomass$Obv, df_biomass$Pred3) %>% mutate(Model = "Pred3"),
+  model_stats(df_biomass$Obv, df_biomass$Pred4) %>% mutate(Model = "Pred4"),
+  model_stats(df_biomass$Obv, df_biomass$Pred5) %>% mutate(Model = "Pred5"),
+  model_stats(df_biomass$Obv, df_biomass$Pred6) %>% mutate(Model = "Pred6")
+) %>%
+  select(Model, everything())
+
+write_csv(mechanistic_scenario2_stats,
+          derived_file("mechanistic_scenario2_stats.csv"))
+
+p_scen2
+mechanistic_scenario2_stats
+```
+
+## Scenario 3: Add Fixed Accessibility to Chemistry
+
+```{r scenario-3-fixed-accessibility}
+summarise_fixed_vh <- function(dat, vh_values, prefix = "pr") {
+  dat %>%
+    drop_na() %>%
+    mutate(
+      pr7 = (3 / ne) * exp(-abs(stoichMet_donor) / (vh_values[1] * npoc)),
+      pr8 = (3 / ne) * exp(-abs(stoichMet_donor) / (vh_values[2] * npoc)),
+      pr9 = (3 / ne) * exp(-abs(stoichMet_donor) / (vh_values[3] * npoc))
+    ) %>%
+    group_by(site, Position) %>%
+    summarise(
+      across(where(is.numeric) & -any_of(c("pr7", "pr8", "pr9")),
+             ~ mean(.x, na.rm = TRUE), .names = "{.col}_mean"),
+      across(c(pr7, pr8, pr9),
+             list(q05 = ~ quantile(.x, 0.05, na.rm = TRUE),
+                  q50 = ~ quantile(.x, 0.50, na.rm = TRUE),
+                  q95 = ~ quantile(.x, 0.95, na.rm = TRUE)),
+             .names = "{.col}_{.fn}"),
+      .groups = "drop"
+    ) %>%
+    mutate(inv_npoc = 1 / npoc_mean,
+           res_scaled = rescale01(respC_mean)) %>%
+    select(site, Position, everything())
+}
+
+make_fixed_vh_plot <- function(df_processed, labels, file_name) {
+  x_col <- "inv_npoc"
+
+  quant_long <- df_processed %>%
+    select(site, Position, all_of(x_col),
+           matches("^pr7_q(05|50|95)$"),
+           matches("^pr8_q(05|50|95)$"),
+           matches("^pr9_q(05|50|95)$")) %>%
+    pivot_longer(
+      cols = matches("^pr[789]_q(05|50|95)$"),
+      names_to = c("metric", "stat"),
+      names_pattern = "(pr[789])_q(05|50|95)",
+      values_to = "value"
+    ) %>%
+    mutate(metric = recode(metric, pr7 = labels[1],
+                           pr8 = labels[2], pr9 = labels[3])) %>%
+    pivot_wider(names_from = stat, values_from = value) %>%
+    mutate(metric = factor(metric, levels = labels))
+
+  quant_scaled <- quant_long %>%
+    group_by(metric) %>%
+    mutate(
+      qmin = min(`05`, `50`, `95`, na.rm = TRUE),
+      qmax = max(`05`, `50`, `95`, na.rm = TRUE),
+      `05` = (`05` - qmin) / (qmax - qmin),
+      `50` = (`50` - qmin) / (qmax - qmin),
+      `95` = (`95` - qmin) / (qmax - qmin)
+    ) %>%
+    ungroup() %>%
+    select(-qmin, -qmax)
+
+  obs_df <- df_processed %>%
+    select(site, Position, all_of(x_col), res_scaled) %>%
+    rename(res = res_scaled)
+
+  color_values <- setNames(c(puor$dark_orange, puor$orange,
+                             puor$light_orange), labels)
+  color_values <- c(color_values, Observed = puor$light_purple)
+
+  p <- ggplot(quant_scaled, aes(x = .data[[x_col]])) +
+    geom_ribbon(aes(ymin = `05`, ymax = `95`, fill = metric),
+                alpha = 0.35, color = NA) +
+    geom_point(aes(y = `50`, color = metric), size = 2, alpha = 0.9) +
+    geom_smooth(aes(y = `50`, color = metric),
+                method = "loess", se = FALSE, linewidth = 1,
+                linetype = "solid") +
+    geom_point(data = obs_df,
+               aes(x = .data[[x_col]], y = res, color = "Observed"),
+               inherit.aes = FALSE, size = 2, alpha = 0.9, shape = 16) +
+    scale_color_manual(values = color_values, name = NULL) +
+    scale_fill_manual(values = color_values[labels], name = NULL) +
+    labs(x = "1/NPOC",
+         y = expression(italic(R)[scaled]~"(Observed & Predicted)")) +
+    theme_review() +
+    theme(legend.position = "right")
+
+  ggsave(figure_file(file_name), p, width = 4.8, height = 3)
+
+  list(plot = p, quant_scaled = quant_scaled, obs_df = obs_df)
+}
+
+df_fixed_vh <- summarise_fixed_vh(all_data, c(0.05, 0.25, 0.50))
+fixed_vh_plot <- make_fixed_vh_plot(
+  df_fixed_vh,
+  labels = c("Vh = 0.05", "Vh = 0.25", "Vh = 0.50"),
+  file_name = "mechanistic_scenario3_chemistry_accessibility.pdf"
+)
+
+df_accessibility_only <- all_data %>%
+  drop_na() %>%
+  mutate(
+    pr7 = exp(-1 / (0.5 * npoc)),
+    pr8 = exp(-1 / (1.0 * npoc)),
+    pr9 = exp(-1 / (2.0 * npoc))
+  ) %>%
+  group_by(site, Position) %>%
+  summarise(
+    across(where(is.numeric) & -any_of(c("pr7", "pr8", "pr9")),
+           ~ mean(.x, na.rm = TRUE), .names = "{.col}_mean"),
+    across(c(pr7, pr8, pr9),
+           list(q05 = ~ quantile(.x, 0.05, na.rm = TRUE),
+                q50 = ~ quantile(.x, 0.50, na.rm = TRUE),
+                q95 = ~ quantile(.x, 0.95, na.rm = TRUE)),
+           .names = "{.col}_{.fn}"),
+    .groups = "drop"
+  ) %>%
+  mutate(inv_npoc = 1 / npoc_mean,
+         res_scaled = rescale01(respC_mean)) %>%
+  select(site, Position, everything())
+
+accessibility_only_plot <- make_fixed_vh_plot(
+  df_accessibility_only,
+  labels = c("Vh = 0.5", "Vh = 1", "Vh = 2"),
+  file_name = "mechanistic_scenario4_accessibility_only.pdf"
+)
+
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  p_mech_scenarios <- (p_scen1 | p_scen2) /
+    (fixed_vh_plot$plot | accessibility_only_plot$plot)
+
+  ggsave(figure_file("mechanistic_revised_figure3_scenarios.pdf"),
+         p_mech_scenarios, width = 9.5, height = 6)
+  p_mech_scenarios
+} else {
+  p_scen1
+  p_scen2
+  fixed_vh_plot$plot
+  accessibility_only_plot$plot
+}
+```
+
+## Fitted Effective `Vh`
+
+```{r fit-effective-vh}
+analysis_table <- read_csv(derived_file("s19s_sed_analysis_table.csv"),
+                           col_types = cols(site = col_character()))
+
+core <- analysis_table %>%
+  filter(complete.cases(respC, npoc, biomass_log10, biomass_raw, ssa_tot,
+                        stoichMet_donor_mean, ne_mean, d50_mm),
+         respC > 0, npoc > 0, biomass_raw > 0, ssa_tot > 0)
+
+df_vh <- core %>%
+  mutate(
+    mu_max = 1,
+    biomass_for_vh = biomass_log10,
+    ratio = respC / (mu_max * biomass_for_vh),
+    Vh = if_else(
+      !is.finite(ratio) | ratio <= 0 | ratio >= 1,
+      NA_real_,
+      -(abs(stoichMet_donor_mean) * inv_npoc) / log(ratio)
+    ),
+    log_Vh = log10(Vh)
+  )
+
+Vh0_global <- median(df_vh$Vh, na.rm = TRUE)
+Vh0_global
+```
+
+```{r mechanistic-baseline}
+mechanistic_predictions <- df_vh %>%
+  mutate(
+    Vh,
+    log_Vh,
+    Vh0_global = Vh0_global,
+    R_mech_global_vh =
+      exp(-abs(stoichMet_donor_mean) / (Vh0_global * npoc)) * biomass_log10,
+    logR_obs = safe_log10(respC),
+    logR_mech_global_vh = safe_log10(R_mech_global_vh),
+    dR_global_vh = logR_obs - logR_mech_global_vh
+  )
+
+write_csv(mechanistic_predictions, derived_file("mechanistic_predictions.csv"))
+
+model_stats(mechanistic_predictions$logR_obs,
+            mechanistic_predictions$logR_mech_global_vh) %>%
+  mutate(Model = "Mechanistic global Vh") %>%
+  select(Model, everything())
+```
+
+```{r vh-diagnostics}
+df_vh_diagnostics <- mechanistic_predictions %>%
+  filter(is.finite(Vh), Vh > 0) %>%
+  mutate(
+    biomass_over_npoc = biomass_log10 / npoc,
+    npoc_over_ssa = npoc / ssa_tot
+  )
+
+cor_label <- function(x, y) {
+  idx <- complete.cases(x, y)
+  if (sum(idx) < 3) return("")
+  ct <- suppressWarnings(cor.test(x[idx], y[idx]))
+  paste0(
+    "R^2 = ", formatC(unname(ct$estimate)^2, digits = 2, format = "f"),
+    "\nP = ", format.pval(ct$p.value, digits = 2, eps = 0.001)
+  )
+}
+
+p_vh <- ggplot(df_vh_diagnostics, aes(x = Vh)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 binwidth = 0.05,
+                 colour = "black", fill = "white") +
+  geom_density(alpha = 0.2, fill = "#e08214") +
+  scale_x_log10(
+    name = "Vh (effective harvest volume)",
+    breaks = c(1e-2, 1e-1, 1e0),
+    labels = c(expression(10^-2), expression(10^-1),
+               expression(10^0)),
+    limits = c(1e-2, 1)
+  ) +
+  geom_vline(
+    aes(xintercept = mean(Vh, na.rm = TRUE)),
+    color = "#e08214", linetype = "dashed", linewidth = 1
+  ) +
+  labs(y = "Density") +
+  ggpubr::theme_pubr(border = TRUE) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 14, face = "bold")
+  )
+
+p_vh_biomass_npoc <- ggplot(df_vh_diagnostics,
+                            aes(x = biomass_over_npoc, y = Vh)) +
+  geom_point(shape = 1, stroke = 1, size = 2, color = "#b35806") +
+  ggpubr::stat_cor(
+    aes(label = paste(..rr.label.., ..p.label.., sep = "*`,`~")),
+    label.x.npc = "left",
+    label.y.npc = "top",
+    vjust = 1
+  ) +
+  ggpmisc::stat_poly_line(color = "black") +
+  ggpubr::theme_pubr(border = TRUE) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 14, face = "bold")
+  ) +
+  xlab(bquote("Biomass/NPOC")) +
+  ylab(bquote("Fitted Vh"))
+
+p_vh_npoc_ssa <- ggplot(df_vh_diagnostics,
+                        aes(x = npoc_over_ssa, y = Vh)) +
+  geom_point(shape = 1, stroke = 1, size = 2, color = "#b35806") +
+  ggpubr::stat_cor(
+    aes(label = paste(..rr.label.., ..p.label.., sep = "*`,`~")),
+    label.x.npc = "right",
+    label.y.npc = "top",
+    hjust = 1,
+    vjust = 1
+  ) +
+  ggpmisc::stat_poly_line(color = "black") +
+  scale_x_log10(
+    name = expression(log[10]~"(NPOC / SSA)"),
+    breaks = c(1e-5, 1e-4, 1e-3),
+    labels = c(expression(10^-5), expression(10^-4), expression(10^-3))
+  ) +
+  ggpubr::theme_pubr(border = TRUE) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 14, face = "bold")
+  ) +
+  ylab(bquote("Fitted Vh"))
+
+write_csv(df_vh_diagnostics, derived_file("fitted_vh_diagnostics.csv"))
+
+ggsave(figure_file("mechanistic_vh_distribution.pdf"), p_vh,
+       width = 3.2, height = 3)
+ggsave(figure_file("mechanistic_vh_vs_biomass_npoc.pdf"), p_vh_biomass_npoc,
+       width = 3.3, height = 3)
+ggsave(figure_file("mechanistic_vh_vs_npoc_ssa.pdf"), p_vh_npoc_ssa,
+       width = 3.3, height = 3)
+
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  p_vh_diagnostics <- p_vh | p_vh_biomass_npoc | p_vh_npoc_ssa
+  ggsave(figure_file("mechanistic_revised_figure4_vh_diagnostics.pdf"),
+         p_vh_diagnostics, width = 9.8, height = 3)
+  p_vh_diagnostics
+} else {
+  p_vh
+  p_vh_biomass_npoc
+  p_vh_npoc_ssa
+}
+```
